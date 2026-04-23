@@ -97,6 +97,12 @@ using namespace std::literals::string_view_literals;
 
 #include <assert.h>
 
+#include <set>
+extern std::set<int> g_sawtooth_z_heights;
+#include <map>
+extern std::map<int, double> g_sawtooth_gaps;
+
+
 namespace Slic3r {
 
 // Only add a newline in case the current G-code does not end with a newline.
@@ -3351,7 +3357,7 @@ double cap_speed(
     return speed;
 }
 
-std::string GCodeGenerator::_extrude(
+std::string GCodeGenerator::_extrude( ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     const ExtrusionAttributes       &path_attr,
     const Geometry::ArcWelder::Path &path,
     const std::string_view           description,
@@ -3574,6 +3580,106 @@ std::string GCodeGenerator::_extrude(
         comment = description;
         comment += description_bridge;
     }
+
+  // --- BEGIN NON-PLANAR IRIT WAVE INJECTION ---
+    int current_z_um = std::round(this->m_last_layer_z * 1000.0);
+    double bottom_z = -1.0;
+
+    
+    // Safely look for our layer within a 20-micron tolerance (Fixes floating point misses!)
+    for (const auto &pair : g_sawtooth_gaps) {
+        if (std::abs(pair.first - current_z_um) <= 20) {
+            bottom_z = pair.second;
+            break;
+        }
+    }
+
+    if (path_attr.role == ExtrusionRole::SupportMaterial && bottom_z >= 0) {
+        double peak_z = this->m_last_layer_z;
+        double gap_height = peak_z - bottom_z;
+
+        // 1. Move to the ceiling. We start high because we want tips at the edges.
+        gcode += m_writer.travel_to_z_force(peak_z, "Move to ceiling for zigzag edge");
+
+        Vec2d prev_exact = this->point_to_gcode(path.front().point);
+        Vec3d last_3d_pt(prev_exact.x(), prev_exact.y(), peak_z);
+        double current_distance_along_path = 0.0;
+
+        auto it = path.begin();
+        for (++it; it != path.end(); ++it) {
+            Vec2d p_exact = this->point_to_gcode(it->point);
+            double dist_2d_segment = (p_exact - prev_exact).norm();
+
+            if (dist_2d_segment > 3.0) {
+                // LONG SEGMENT: Generate dynamic IRIT teeth
+                int num_teeth = std::round(dist_2d_segment / 4.0); // Targets ~4mm widths
+                if (num_teeth < 1)
+                    num_teeth = 1;
+                double tooth_width = dist_2d_segment / num_teeth;
+
+                int steps = std::max(1, (int) std::ceil(dist_2d_segment / 0.5)); // Micro-segments
+                for (int s = 1; s <= steps; ++s) {
+                    double t = (double) s / steps;
+                    Vec2d interpolated_2d = prev_exact + (p_exact - prev_exact) * t;
+
+                    double step_dist = dist_2d_segment / steps;
+                    current_distance_along_path += step_dist;
+
+                    // IRIT SHAPE MATH (Plateau -> Slope Down -> Steep Up)
+                    double phase = std::fmod(current_distance_along_path, tooth_width) / tooth_width;
+                    double current_z = 0;
+
+                    if (phase <= 0.20) {
+                        current_z = peak_z; // 20% Plateau at ceiling
+                    } else if (phase <= 0.90) {
+                        // 70% Downward slope
+                        double drop_progress = (phase - 0.20) / 0.70;
+                        current_z = peak_z - (drop_progress * gap_height);
+                    } else {
+                        // 10% Steep line up
+                        double rise_progress = (phase - 0.90) / 0.10;
+                        current_z = bottom_z + (rise_progress * gap_height);
+                    }
+
+                    // Clamp Z to prevent any floating point rounding overlaps
+                    current_z = std::max(bottom_z, std::min(peak_z, current_z));
+
+                    Vec3d target_3d(interpolated_2d.x(), interpolated_2d.y(), current_z);
+
+                    // True 3D Extrusion Match
+                    double true_3d_dist = (target_3d - last_3d_pt).norm();
+                    double e_val = e_per_mm * true_3d_dist * it->e_fraction;
+
+                    gcode += m_writer.extrude_to_xyz(target_3d, e_val);
+                    last_3d_pt = target_3d;
+                }
+            } else if (dist_2d_segment > 0.001) {
+                // SHORT SEGMENT: Zigzag turnaround. Stay perfectly flat at the ceiling.
+                Vec3d target_edge(p_exact.x(), p_exact.y(), peak_z);
+                double e_edge = e_per_mm * dist_2d_segment * it->e_fraction;
+                gcode += m_writer.extrude_to_xyz(target_edge, e_edge);
+                last_3d_pt = target_edge;
+            }
+
+            // Reset phase tracker so the next long sweep starts cleanly at the plateau
+            if (dist_2d_segment <= 3.0) {
+                current_distance_along_path = 0.0;
+            }
+
+            prev_exact = p_exact;
+        }
+
+        if (m_enable_cooling_markers)
+            gcode += ";_EXTRUDE_END\n";
+        this->last_position = path.back().point;
+        return gcode;
+    }
+    // --- END NON-PLANAR IRIT WAVE INJECTION ---
+
+
+
+
+
     Vec2d prev_exact = this->point_to_gcode(path.front().point);
     Vec2d prev = GCodeFormatter::quantize(prev_exact);
     auto  it   = path.begin();

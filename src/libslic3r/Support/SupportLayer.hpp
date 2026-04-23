@@ -44,6 +44,11 @@ enum class SupporLayerType {
 class SupportGeneratorLayer
 {
 public:
+
+
+	bool is_nonplanar_sawtooth = false;
+	double custom_height = 0.0; // To store adaptive height
+
 	void reset() {
 		*this = SupportGeneratorLayer();
 	}

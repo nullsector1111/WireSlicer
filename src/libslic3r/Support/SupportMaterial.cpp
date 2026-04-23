@@ -77,6 +77,12 @@
 
 #include <cassert>
 
+
+#include <set> 
+std::set<int> g_sawtooth_z_heights;
+#include <map>
+std::map<int, double> g_sawtooth_gaps;
+
 using namespace Slic3r::FFFSupport;
 
 namespace Slic3r {
@@ -2223,12 +2229,19 @@ SupportGeneratorLayersPtr PrintObjectSupportMaterial::raft_and_intermediate_supp
             assert(intermediate_layers.empty() || intermediate_layers.back()->print_z <= m_slicing_params.first_print_layer_height);
             // At this point only layers above first_print_layer_heigth + EPSILON are expected as the other cases were captured earlier.
             assert(extr2z >= m_slicing_params.first_print_layer_height + EPSILON);
-            // Generate a new intermediate layer.
+            
+            
+            
+           // Generate a new intermediate layer.
+
             SupportGeneratorLayer &layer_new = layer_storage.allocate_unguarded(SupporLayerType::Intermediate);
             layer_new.bottom_z = 0.;
             layer_new.print_z  = extr1z = m_slicing_params.first_print_layer_height;
             layer_new.height   = extr1z;
             intermediate_layers.push_back(&layer_new);
+
+
+
             // Continue printing the other layers up to extr2z.
         }
         coordf_t      dist   = extr2z - extr1z;
@@ -2318,6 +2331,7 @@ SupportGeneratorLayersPtr PrintObjectSupportMaterial::raft_and_intermediate_supp
                 assert(intermediate_layers.empty() || intermediate_layers.back()->print_z <= layer_new.print_z);
                 intermediate_layers.push_back(&layer_new);
             }
+            
         }
     }
 
@@ -2482,6 +2496,51 @@ void PrintObjectSupportMaterial::generate_base_layers(
 #endif /* SLIC3R_DEBUG */
 
     this->trim_support_layers_by_object(object, intermediate_layers, m_slicing_params.gap_support_object, m_slicing_params.gap_object_support, m_support_params.gap_xy);
+    
+ // --- BEGIN NON-PLANAR DYNAMIC HACK V3 ---
+    int target_planar_layers = 2; // Flat layers at the bottom to stick to the bed
+    double max_sawtooth_height = 2.5;
+    double min_sawtooth_height = 0.4;
+
+    double gap_floor_z = intermediate_layers.empty() ? 0 : intermediate_layers.front()->bottom_z;
+    int planar_counter = 0;
+
+    for (size_t i = 0; i < intermediate_layers.size(); ++i) {
+        SupportGeneratorLayer *layer = intermediate_layers[i];
+        bool is_last_layer_in_stack = (i == intermediate_layers.size() - 1);
+
+        // 1. Force flat base layers to ensure bed adhesion and structure
+        if (planar_counter < target_planar_layers) {
+            layer->is_nonplanar_sawtooth = false;
+            gap_floor_z = layer->print_z; // Move the floor up
+            planar_counter++;
+        } else {
+            double current_gap = layer->print_z - gap_floor_z;
+
+            // 2. Trigger sawtooth if we hit max height OR the interface ceiling
+            if (current_gap >= max_sawtooth_height - EPSILON || is_last_layer_in_stack) {
+                if (current_gap < min_sawtooth_height) {
+                    // Gap is too tiny (e.g., 0.2mm). Print a normal flat layer.
+                    layer->is_nonplanar_sawtooth = false;
+                    gap_floor_z = layer->print_z;
+                    planar_counter++;
+                } else {
+                    // FIRE THE SAWTOOTH! Tag the ceiling.
+                    layer->is_nonplanar_sawtooth = true;
+                    g_sawtooth_gaps[std::round(layer->print_z * 1000.0)] = gap_floor_z;
+
+                    // Reset. After this sawtooth, it will print planar layers again.
+                    gap_floor_z = layer->print_z;
+                    planar_counter = 0;
+                }
+            } else {
+                // 3. Inside the gap. Delete the plastic so we don't print in mid-air.
+                layer->polygons.clear();
+                layer->is_nonplanar_sawtooth = false;
+            }
+        }
+    }
+    // --- END NON-PLANAR DYNAMIC HACK V3 ---
 }
 
 void PrintObjectSupportMaterial::trim_support_layers_by_object(

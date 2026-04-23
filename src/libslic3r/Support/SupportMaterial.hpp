@@ -89,6 +89,11 @@ private:
 	    const coordf_t       gap_extra_below,
 	    const coordf_t       gap_xy) const;
 
+
+	// Custom non-planar path 
+	void process_sawtooth_paths(FFFSupport::SupportGeneratorLayer &layer);
+
+
 /*
 	void generate_pillars_shape();
 	void clip_with_shape();
