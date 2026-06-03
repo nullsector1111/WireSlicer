@@ -100,10 +100,8 @@ using namespace std::literals::string_view_literals;
 #include <set>
 extern std::set<int> g_sawtooth_z_heights;
 #include <map>
-//extern std::map<int, double> g_sawtooth_gaps;
-#include <vector>
-#include <tuple>
-extern std::vector<std::tuple<double, double, double, double>> g_sawtooth_gaps;
+extern std::map<int, double> g_sawtooth_gaps;
+extern std::map<int, double> g_sawtooth_tops; // new
 namespace Slic3r {
 
 // Only add a newline in case the current G-code does not end with a newline.
@@ -3582,38 +3580,49 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
         comment += description_bridge;
     }
 
-// --- BEGIN NON-PLANAR TOOLPATH INJECTION V8 ---
-    double peak_z = this->m_last_layer_z;
+// --- BEGIN NON-PLANAR TOOLPATH INJECTION V12 ---
+    double original_peak_z = this->m_last_layer_z;
     double bottom_z = -1.0;
+    double top_limit_z = -1.0;
 
-    double px = unscale<double>(path.front().point.x());
-    double py = unscale<double>(path.front().point.y());
-
-    double min_dist = 999999.0;
-    for (const auto &gap : g_sawtooth_gaps) {
-        double gap_floor = std::get<0>(gap);
-        double gap_peak = std::get<1>(gap);
-        double cx = std::get<2>(gap);
-        double cy = std::get<3>(gap);
-
-        if (std::abs(gap_peak - peak_z) <= 0.10) {
-            double dist = std::sqrt((cx - px) * (cx - px) + (cy - py) * (cy - py));
-            if (dist < min_dist) {
-                min_dist = dist;
-                bottom_z = gap_floor;
-            }
+    // Look for a ceiling tag within a 150-micron safety tolerance
+    int current_z_um = std::round(original_peak_z * 1000.0);
+    for (const auto &pair : g_sawtooth_gaps) {
+        if (std::abs(pair.first - current_z_um) <= 150) {
+            bottom_z = pair.second;
+            break;
+        }
+    }
+    // Optional per-ceiling max Z (used when near support interface)
+    for (const auto &pair : g_sawtooth_tops) {
+        if (std::abs(pair.first - current_z_um) <= 150) {
+            top_limit_z = pair.second;
+            break;
         }
     }
 
-    // We ONLY bend standard SupportMaterial. The Interface layer stays completely flat!
+    // ONLY bend standard SupportMaterial. Interface layers stay completely flat!
     if (path_attr.role == ExtrusionRole::SupportMaterial && bottom_z >= 0) {
-        double gap_height = peak_z - bottom_z;
+        // Default: peak is one layer below the nominal ceiling
+        double true_peak_z = original_peak_z - 0.20;
+
+        // If we have a per-ceiling max, clamp to it so we never poke into interface
+        if (top_limit_z > 0.0)
+            true_peak_z = std::min(true_peak_z, top_limit_z);
+
+        // Ensure we still have some height above the floor
+        if (true_peak_z <= bottom_z)
+            true_peak_z = bottom_z + 0.05;
+
+        double gap_height = true_peak_z - bottom_z;
         Vec2d prev_exact = this->point_to_gcode(path.front().point);
         auto it = path.begin();
 
+        // Ensure we start exactly at the start point, dropped to the structural floor
         gcode += m_writer.travel_to_xyz(
             Vec3d(prev_exact.x(), prev_exact.y(), bottom_z), "Drop to floor for anchor"
         );
+
 
         for (++it; it != path.end(); ++it) {
             Vec2d p_exact = this->point_to_gcode(it->point);
@@ -3628,22 +3637,25 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
                 double plateau_dist = tooth_width * 0.30;
                 double slope_dist = tooth_width - plateau_dist;
 
+                // 1. Initial Vertical Anchor Pillar
                 gcode += m_writer.travel_to_xyz(
                     Vec3d(prev_exact.x(), prev_exact.y(), bottom_z), "Anchor base"
                 );
                 double e_up_anchor = e_per_mm * gap_height * it->e_fraction;
                 gcode += m_writer.extrude_to_xyz(
-                    Vec3d(prev_exact.x(), prev_exact.y(), peak_z), e_up_anchor
+                    Vec3d(prev_exact.x(), prev_exact.y(), true_peak_z), e_up_anchor
                 );
 
                 for (int i = 0; i < num_teeth; ++i) {
                     double base_offset = i * tooth_width;
 
+                    // 2. THE PLATEAU (Flat across the ceiling to cool)
                     Vec2d p_plat = prev_exact + Vec2d(ux, uy) * (base_offset + plateau_dist);
-                    Vec3d p_plat_3d(p_plat.x(), p_plat.y(), peak_z);
+                    Vec3d p_plat_3d(p_plat.x(), p_plat.y(), true_peak_z);
                     double e_plat = e_per_mm * plateau_dist * it->e_fraction;
                     gcode += m_writer.extrude_to_xyz(p_plat_3d, e_plat);
 
+                    // 3. SLOPE DOWN (Diagonal back to the floor)
                     Vec2d p_end = prev_exact + Vec2d(ux, uy) * (base_offset + tooth_width);
                     Vec3d p_end_3d(p_end.x(), p_end.y(), bottom_z);
                     double true_3d_slope = std::sqrt(
@@ -3652,12 +3664,14 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
                     double e_slope = e_per_mm * true_3d_slope * it->e_fraction;
                     gcode += m_writer.extrude_to_xyz(p_end_3d, e_slope);
 
-                    Vec3d p_peak_up(p_end.x(), p_end.y(), peak_z);
+                    // 4. STRAIGHT UP (Pure Vertical Extrusion back to the ceiling)
+                    Vec3d p_peak_up(p_end.x(), p_end.y(), true_peak_z);
                     double e_up = e_per_mm * gap_height * it->e_fraction;
                     gcode += m_writer.extrude_to_xyz(p_peak_up, e_up);
                 }
             } else if (dist_2d_segment > 0.001) {
-                Vec3d target_edge(p_exact.x(), p_exact.y(), peak_z);
+                // TURNAROUND: Short edge segments stay completely flat at the new clearance ceiling
+                Vec3d target_edge(p_exact.x(), p_exact.y(), true_peak_z);
                 double e_edge = e_per_mm * dist_2d_segment * it->e_fraction;
                 gcode += m_writer.extrude_to_xyz(target_edge, e_edge);
             }
@@ -3669,7 +3683,7 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
         this->last_position = path.back().point;
         return gcode;
     }
-    // --- END NON-PLANAR TOOLPATH INJECTION V8 ---
+    // --- END NON-PLANAR TOOLPATH INJECTION V12 ---
 
 
 

@@ -80,11 +80,12 @@
 
 #include <set> 
 std::set<int> g_sawtooth_z_heights;
-#include <map>
 //std::map<int, double> g_sawtooth_gaps;
-#include <vector>
-// Format: Floor Z, Peak Z, Centroid X, Centroid Y
-std::vector<std::tuple<double, double, double, double>> g_sawtooth_gaps;
+#include <map>
+#include <cmath>
+// Key: Ceiling Z in microns, Value: Floor Z
+std::map<int, double> g_sawtooth_gaps; // already there
+std::map<int, double> g_sawtooth_tops; // NEW: per-ceiling max Z for teeth
 
 using namespace Slic3r::FFFSupport;
 
@@ -2500,137 +2501,118 @@ void PrintObjectSupportMaterial::generate_base_layers(
 
     this->trim_support_layers_by_object(object, intermediate_layers, m_slicing_params.gap_support_object, m_slicing_params.gap_object_support, m_support_params.gap_xy);
     
- // --- BEGIN NON-PLANAR DYNAMIC HACK V8 ---
-    int target_planar_layers = 2;
+// --- BEGIN NON-PLANAR DYNAMIC HACK V9 ---
+    int target_planar_layers = 2; // Flat layers to squish the previous teeth
     double max_gap = 2.5;
 
     std::vector<bool> keep_layer(intermediate_layers.size(), true);
     std::vector<bool> is_sawtooth(intermediate_layers.size(), false);
     std::vector<double> gap_floors(intermediate_layers.size(), 0.0);
 
-    // Helper: Get Bounding Box of a layer to track pillars geometrically
-    auto get_bbox = [](SupportGeneratorLayer *l) {
-        double min_x = 1e9, min_y = 1e9, max_x = -1e9, max_y = -1e9;
-        for (const Slic3r::Polygon &p : l->polygons) {
-            for (const Slic3r::Point &pt : p.points) {
-                double px = unscale<double>(pt.x());
-                double py = unscale<double>(pt.y());
-                if (px < min_x)
-                    min_x = px;
-                if (py < min_y)
-                    min_y = py;
-                if (px > max_x)
-                    max_x = px;
-                if (py > max_y)
-                    max_y = py;
-            }
-        }
-        return std::make_tuple(min_x, min_y, max_x, max_y);
+    // Helper: total 2D area of all support plastic on this layer
+    auto get_area = [](SupportGeneratorLayer *l) {
+        double a = 0.0;
+        for (const Slic3r::Polygon &p : l->polygons)
+            a += std::abs(p.area());
+        return a;
     };
 
-    auto bboxes_intersect = [](const auto &b1, const auto &b2) {
-        return !(
-            std::get<0>(b1) > std::get<2>(b2) + 1.0 || std::get<2>(b1) < std::get<0>(b2) - 1.0 ||
-            std::get<1>(b1) > std::get<3>(b2) + 1.0 || std::get<3>(b1) < std::get<1>(b2) - 1.0
-        );
-    };
-
+    // Collect only layers that actually have support polygons
     std::vector<size_t> valid_indices;
     for (size_t i = 0; i < intermediate_layers.size(); ++i) {
-        if (!intermediate_layers[i]->polygons.empty()) {
+        if (!intermediate_layers[i]->polygons.empty())
             valid_indices.push_back(i);
-        } else {
+        else
             keep_layer[i] = false;
-        }
     }
 
     if (!valid_indices.empty()) {
         double current_floor = intermediate_layers[valid_indices[0]]->bottom_z;
         int planar_count = 0;
 
-        for (size_t idx = 0; idx < valid_indices.size();) {
+        for (size_t idx = 0; idx < valid_indices.size(); ++idx) {
             size_t i = valid_indices[idx];
-            SupportGeneratorLayer *layer = intermediate_layers[i];
+            auto *layer = intermediate_layers[i];
+            bool is_last = (idx == valid_indices.size() - 1);
+
+            double current_area = get_area(layer);
+            double next_area = is_last ? 0.0 : get_area(intermediate_layers[valid_indices[idx + 1]]);
 
             if (planar_count < target_planar_layers) {
+                // First N layers above the floor stay planar (squish layers)
                 keep_layer[i] = true;
                 is_sawtooth[i] = false;
                 current_floor = layer->print_z;
                 planar_count++;
-                idx++;
             } else {
-                auto bbox = get_bbox(layer);
-                size_t ceiling_idx = idx;
+                double gap = layer->print_z - current_floor;
 
-                // Lookahead to find when the gap reaches max height OR the pillar physically ends
-                for (size_t look = idx + 1; look < valid_indices.size(); ++look) {
-                    size_t look_i = valid_indices[look];
-                    SupportGeneratorLayer *look_layer = intermediate_layers[look_i];
-                    auto look_bbox = get_bbox(look_layer);
+                bool force_last = is_last;
+                bool force_height = (gap >= max_gap - EPSILON);
+                bool force_interface =
+                    (next_area < current_area * 0.85); // area drop => interface ahead
 
-                    if (!bboxes_intersect(bbox, look_bbox)) {
-                        break; // Pillar geometrically ended here! Force a ceiling.
+                bool force_ceiling = force_last || force_height || force_interface;
+
+                if (force_ceiling) {
+                    // Decide which layer becomes the sawtooth ceiling:
+                    // - normal case (height/last): current layer 'i'
+                    // - interface case: previous support layer becomes the ceiling,
+                    //   and this current layer stays planar as the flat cap under the interface.
+                    size_t ceiling_valid_idx = idx;
+                    if (force_interface && idx > 0)
+                        ceiling_valid_idx = idx - 1;
+
+                    size_t ceiling_layer_idx = valid_indices[ceiling_valid_idx];
+                    auto *ceiling_layer = intermediate_layers[ceiling_layer_idx];
+
+                    keep_layer[ceiling_layer_idx] = true;
+                    is_sawtooth[ceiling_layer_idx] = true;
+                    gap_floors[ceiling_layer_idx] = current_floor;
+
+                    // Current layer: keep it planar if it is above the ceiling
+                    if (ceiling_layer_idx != i) {
+                        keep_layer[i] = true;
+                        is_sawtooth[i] = false;
                     }
 
-                    ceiling_idx = look;
-                    if (look_layer->print_z - current_floor >= max_gap - EPSILON) {
-                        break; // Reached perfect 2.5mm sawtooth height
-                    }
-                }
-
-                size_t c_i = valid_indices[ceiling_idx];
-                double gap_height = intermediate_layers[c_i]->print_z - current_floor;
-
-                if (gap_height < 0.4) {
-                    keep_layer[c_i] = true;
-                    is_sawtooth[c_i] = false;
-                    current_floor = intermediate_layers[c_i]->print_z;
-                    planar_count++;
-                } else {
-                    keep_layer[c_i] = true;
-                    is_sawtooth[c_i] = true;
-                    gap_floors[c_i] = current_floor;
-
-                    // Delete empty air layers in between
-                    for (size_t del = idx; del < ceiling_idx; ++del) {
-                        keep_layer[valid_indices[del]] = false;
+                    // Delete “air” layers between floor and this ceiling
+                    for (size_t search_idx = ceiling_valid_idx; search_idx > 0; --search_idx) {
+                        size_t k = valid_indices[search_idx - 1];
+                        if (intermediate_layers[k]->print_z <= current_floor + EPSILON)
+                            break;
+                        if (k == ceiling_layer_idx)
+                            continue;
+                        keep_layer[k] = false;
                     }
 
-                    current_floor = intermediate_layers[c_i]->print_z;
+                    // Start a new sandwich from the highest solid layer we have here.
+                    // We want the next sandwich to sit on the current (possibly planar cap) layer.
+                    current_floor = layer->print_z;
                     planar_count = 0;
+                } else {
+                    // Candidate non-planar layers are tentatively deleted
+                    keep_layer[i] = false;
                 }
-                idx = ceiling_idx + 1;
             }
         }
     }
 
-    // 3. Track Spatial Coordinates
+    // Apply deletions and map sawtooth ceilings into g_sawtooth_gaps
     for (size_t i = 0; i < intermediate_layers.size(); ++i) {
-        SupportGeneratorLayer *layer = intermediate_layers[i];
+        auto *layer = intermediate_layers[i];
         if (!keep_layer[i]) {
             layer->polygons.clear();
             layer->is_nonplanar_sawtooth = false;
         } else {
             layer->is_nonplanar_sawtooth = is_sawtooth[i];
             if (is_sawtooth[i]) {
-                double cx = 0, cy = 0;
-                int pts = 0;
-                for (const Slic3r::Polygon &p : layer->polygons) {
-                    for (const Slic3r::Point &pt : p.points) {
-                        cx += unscale<double>(pt.x());
-                        cy += unscale<double>(pt.y());
-                        pts++;
-                    }
-                }
-                if (pts > 0) {
-                    cx /= pts;
-                    cy /= pts;
-                }
-                g_sawtooth_gaps.emplace_back(gap_floors[i], layer->print_z, cx, cy);
+                int z_key = std::round(layer->print_z * 1000.0);
+                g_sawtooth_gaps[z_key] = gap_floors[i];
             }
         }
     }
-    // --- END NON-PLANAR DYNAMIC HACK V8 ---
+    // --- END NON-PLANAR DYNAMIC HACK V9 ---
 }
 
 void PrintObjectSupportMaterial::trim_support_layers_by_object(
