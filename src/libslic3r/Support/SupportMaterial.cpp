@@ -81,7 +81,10 @@
 #include <set> 
 std::set<int> g_sawtooth_z_heights;
 #include <map>
-std::map<int, double> g_sawtooth_gaps;
+//std::map<int, double> g_sawtooth_gaps;
+#include <vector>
+// Format: Floor Z, Peak Z, Centroid X, Centroid Y
+std::vector<std::tuple<double, double, double, double>> g_sawtooth_gaps;
 
 using namespace Slic3r::FFFSupport;
 
@@ -2497,50 +2500,94 @@ void PrintObjectSupportMaterial::generate_base_layers(
 
     this->trim_support_layers_by_object(object, intermediate_layers, m_slicing_params.gap_support_object, m_slicing_params.gap_object_support, m_support_params.gap_xy);
     
- // --- BEGIN NON-PLANAR DYNAMIC HACK V3 ---
-    int target_planar_layers = 2; // Flat layers at the bottom to stick to the bed
-    double max_sawtooth_height = 2.5;
-    double min_sawtooth_height = 0.4;
+ // --- BEGIN NON-PLANAR DYNAMIC HACK V4 ---
+    int target_planar_layers = 2; // Flat layers to stick to the bed
+    double max_gap = 2.5;
+    double min_gap = 0.5;
 
-    double gap_floor_z = intermediate_layers.empty() ? 0 : intermediate_layers.front()->bottom_z;
-    int planar_counter = 0;
+    std::vector<bool> keep_layer(intermediate_layers.size(), true);
+    std::vector<bool> is_sawtooth(intermediate_layers.size(), false);
+    std::vector<double> gap_floors(intermediate_layers.size(), 0.0);
 
+    double current_floor = intermediate_layers.empty() ? 0 : intermediate_layers[0]->bottom_z;
+    int planar_count = 0;
+
+    // PASS 1: Mathematical Lookahead
     for (size_t i = 0; i < intermediate_layers.size(); ++i) {
         SupportGeneratorLayer *layer = intermediate_layers[i];
-        bool is_last_layer_in_stack = (i == intermediate_layers.size() - 1);
+        bool is_last = (i == intermediate_layers.size() - 1);
 
-        // 1. Force flat base layers to ensure bed adhesion and structure
-        if (planar_counter < target_planar_layers) {
-            layer->is_nonplanar_sawtooth = false;
-            gap_floor_z = layer->print_z; // Move the floor up
-            planar_counter++;
+        if (planar_count < target_planar_layers) {
+            keep_layer[i] = true;
+            is_sawtooth[i] = false;
+            current_floor = layer->print_z;
+            planar_count++;
         } else {
-            double current_gap = layer->print_z - gap_floor_z;
+            double gap = layer->print_z - current_floor;
 
-            // 2. Trigger sawtooth if we hit max height OR the interface ceiling
-            if (current_gap >= max_sawtooth_height - EPSILON || is_last_layer_in_stack) {
-                if (current_gap < min_sawtooth_height) {
-                    // Gap is too tiny (e.g., 0.2mm). Print a normal flat layer.
-                    layer->is_nonplanar_sawtooth = false;
-                    gap_floor_z = layer->print_z;
-                    planar_counter++;
+            if (gap >= max_gap - EPSILON || is_last) {
+                if (gap < min_gap) {
+                    // ABORT GAP: Too small! Restore all deleted layers in this chunk!
+                    for (size_t k = i;
+                         k > 0 && intermediate_layers[k]->print_z > current_floor + EPSILON; --k) {
+                        keep_layer[k] = true;
+                        is_sawtooth[k] = false;
+                    }
+                    keep_layer[i] = true;
+                    is_sawtooth[i] = false;
+                    current_floor = layer->print_z;
+                    planar_count++;
                 } else {
-                    // FIRE THE SAWTOOTH! Tag the ceiling.
-                    layer->is_nonplanar_sawtooth = true;
-                    g_sawtooth_gaps[std::round(layer->print_z * 1000.0)] = gap_floor_z;
+                    // VALID SAWTOOTH! Tag the ceiling.
+                    keep_layer[i] = true;
+                    is_sawtooth[i] = true;
+                    gap_floors[i] = current_floor;
 
-                    // Reset. After this sawtooth, it will print planar layers again.
-                    gap_floor_z = layer->print_z;
-                    planar_counter = 0;
+                    // Confirm deletion of empty air
+                    for (size_t k = i - 1;
+                         k > 0 && intermediate_layers[k]->print_z > current_floor + EPSILON; --k) {
+                        keep_layer[k] = false;
+                    }
+                    current_floor = layer->print_z;
+                    planar_count = 0;
                 }
             } else {
-                // 3. Inside the gap. Delete the plastic so we don't print in mid-air.
-                layer->polygons.clear();
-                layer->is_nonplanar_sawtooth = false;
+                // Growing gap, tentatively delete.
+                keep_layer[i] = false;
             }
         }
     }
-    // --- END NON-PLANAR DYNAMIC HACK V3 ---
+
+   // PASS 2: Execute Deletions & Track Spatial Coordinates
+    for (size_t i = 0; i < intermediate_layers.size(); ++i) {
+        SupportGeneratorLayer *layer = intermediate_layers[i];
+        if (!keep_layer[i]) {
+            layer->polygons.clear();
+            layer->is_nonplanar_sawtooth = false;
+        } else {
+            layer->is_nonplanar_sawtooth = is_sawtooth[i];
+            if (is_sawtooth[i]) {
+                // Calculate the 2D Centroid of this specific support pillar
+                double cx = 0, cy = 0;
+                int pts = 0;
+                for (const Slic3r::Polygon &p : layer->polygons) {
+                    for (const Slic3r::Point &pt : p.points) {
+                        cx += unscale<double>(pt.x());
+                        cy += unscale<double>(pt.y());
+                        pts++;
+                    }
+                }
+                if (pts > 0) {
+                    cx /= pts;
+                    cy /= pts;
+                }
+
+                // Save the unique pillar: Floor, Ceiling, X, Y
+                g_sawtooth_gaps.emplace_back(gap_floors[i], layer->print_z, cx, cy);
+            }
+        }
+    }
+    // --- END NON-PLANAR DYNAMIC HACK V4 ---
 }
 
 void PrintObjectSupportMaterial::trim_support_layers_by_object(
