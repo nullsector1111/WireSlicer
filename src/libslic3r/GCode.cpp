@@ -3582,7 +3582,7 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
         comment += description_bridge;
     }
 
- // --- BEGIN NON-PLANAR TOOLPATH INJECTION ---
+ // --- BEGIN NON-PLANAR TOOLPATH INJECTION V5 ---
     double peak_z = this->m_last_layer_z;
     double bottom_z = -1.0;
 
@@ -3598,7 +3598,6 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
         double cx = std::get<2>(gap);
         double cy = std::get<3>(gap);
 
-        // Match Z-ceiling with a loose 50-micron tolerance
         if (std::abs(gap_peak - peak_z) <= 0.05) {
             double dist = std::sqrt((cx - px) * (cx - px) + (cy - py) * (cy - py));
             if (dist < min_dist) {
@@ -3610,67 +3609,67 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
 
     if (path_attr.role == ExtrusionRole::SupportMaterial && bottom_z >= 0) {
         double gap_height = peak_z - bottom_z;
+        Vec2d p_start = this->point_to_gcode(path.front().point);
 
-        // Start high. The corners must always be at the ceiling!
-        gcode += m_writer.travel_to_z_force(peak_z, "Move to ceiling for zigzag edge");
+        // INITIAL ANCHOR: Drop to floor and extrude straight UP to corner A
+        gcode +=
+            m_writer.travel_to_xyz(Vec3d(p_start.x(), p_start.y(), bottom_z), "Drop to floor anchor");
+        gcode +=
+            m_writer.extrude_to_xyz(Vec3d(p_start.x(), p_start.y(), peak_z), e_per_mm * gap_height);
 
-        Vec2d prev_exact = this->point_to_gcode(path.front().point);
+        Vec2d prev_exact = p_start;
         Vec3d last_3d_pt(prev_exact.x(), prev_exact.y(), peak_z);
 
         auto it = path.begin();
         for (++it; it != path.end(); ++it) {
             Vec2d p_exact = this->point_to_gcode(it->point);
-            double dist_2d_segment = (p_exact - prev_exact).norm();
+            double dist_2d = (p_exact - prev_exact).norm();
 
             // Treat anything longer than 1.0mm as a valid line for sawteeth
-            if (dist_2d_segment > 1.0) {
+            if (dist_2d > 1.0) {
                 // Dynamically scale teeth to a max of 5mm width
-                int num_teeth = std::ceil(dist_2d_segment / 5.0);
-                double tooth_width = dist_2d_segment / num_teeth;
+                int num_teeth = std::ceil(dist_2d / 5.0);
+                double tooth_width = dist_2d / num_teeth;
 
-                double ux = (p_exact.x() - prev_exact.x()) / dist_2d_segment;
-                double uy = (p_exact.y() - prev_exact.y()) / dist_2d_segment;
+                double ux = (p_exact.x() - prev_exact.x()) / dist_2d;
+                double uy = (p_exact.y() - prev_exact.y()) / dist_2d;
 
                 // Shape configuration
-                double plateau_dist = tooth_width * 0.30;
-                double slope_dist = tooth_width - plateau_dist;
+                double plateau_dist = tooth_width * 0.30;       // 30% Plateau
+                double slope_dist = tooth_width - plateau_dist; // 70% Slope Down
 
                 for (int i = 0; i < num_teeth; ++i) {
                     double base_offset = i * tooth_width;
 
-                    // 1. THE PLATEAU (Flat across the ceiling to cool)
+                    // 1. THE PLATEAU (Flat across the ceiling)
                     Vec2d p_plat = prev_exact + Vec2d(ux, uy) * (base_offset + plateau_dist);
                     Vec3d p_plat_3d(p_plat.x(), p_plat.y(), peak_z);
                     double e_plat = e_per_mm * plateau_dist * it->e_fraction;
                     gcode += m_writer.extrude_to_xyz(p_plat_3d, e_plat);
-                    last_3d_pt = p_plat_3d;
 
-                    // 2. SLOPE DOWN (Diagonal back to the floor)
+                    // 2. SLOPE DOWN (Diagonal to the floor)
                     Vec2d p_end = prev_exact + Vec2d(ux, uy) * (base_offset + tooth_width);
                     Vec3d p_end_3d(p_end.x(), p_end.y(), bottom_z);
-
                     double true_3d_slope = std::sqrt(
                         slope_dist * slope_dist + gap_height * gap_height
                     );
                     double e_slope = e_per_mm * true_3d_slope * it->e_fraction;
                     gcode += m_writer.extrude_to_xyz(p_end_3d, e_slope);
-                    last_3d_pt = p_end_3d;
 
                     // 3. STRAIGHT UP (Pure Vertical Extrusion back to the ceiling)
-                    // The nozzle moves Z while X/Y remain identical to p_end
                     Vec3d p_peak_up(p_end.x(), p_end.y(), peak_z);
                     double e_up = e_per_mm * gap_height * it->e_fraction;
                     gcode += m_writer.extrude_to_xyz(p_peak_up, e_up);
+
                     last_3d_pt = p_peak_up;
                 }
-            } else if (dist_2d_segment > 0.001) {
-                // TURNAROUND: Short edge segments just stay completely flat at the ceiling
+            } else if (dist_2d > 0.001) {
+                // TURNAROUND: Short edge segments stay completely flat at the ceiling
                 Vec3d target_edge(p_exact.x(), p_exact.y(), peak_z);
-                double e_edge = e_per_mm * dist_2d_segment * it->e_fraction;
+                double e_edge = e_per_mm * dist_2d * it->e_fraction;
                 gcode += m_writer.extrude_to_xyz(target_edge, e_edge);
                 last_3d_pt = target_edge;
             }
-
             prev_exact = p_exact;
         }
 
@@ -3679,7 +3678,7 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
         this->last_position = path.back().point;
         return gcode;
     }
-    // --- END NON-PLANAR TOOLPATH INJECTION ---
+    // --- END NON-PLANAR TOOLPATH INJECTION V5 ---
 
 
 
