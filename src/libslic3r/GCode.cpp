@@ -102,6 +102,13 @@ extern std::set<int> g_sawtooth_z_heights;
 #include <map>
 extern std::map<int, double> g_sawtooth_gaps;
 extern std::map<int, double> g_sawtooth_tops; // new
+
+
+static constexpr double SAW_TOOTH_OVERSHOOT = 0.50; // how far above the planner’s ceiling we go (mm)
+static constexpr double SAW_TOOTH_MIN_HEIGHT = 0.05;
+static constexpr double SAW_TOOTH_MAX_TOTAL = 2.50; // floor-to-peak max, adjust if needed
+
+
 namespace Slic3r {
 
 // Only add a newline in case the current G-code does not end with a newline.
@@ -3583,45 +3590,41 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
 // --- BEGIN NON-PLANAR TOOLPATH INJECTION V12 ---
     double original_peak_z = this->m_last_layer_z;
     double bottom_z = -1.0;
-    double top_limit_z = -1.0;
 
-    // Look for a ceiling tag within a 150-micron safety tolerance
+    // Look for an exact ceiling tag for this layer
     int current_z_um = std::round(original_peak_z * 1000.0);
-    for (const auto &pair : g_sawtooth_gaps) {
-        if (std::abs(pair.first - current_z_um) <= 150) {
-            bottom_z = pair.second;
-            break;
-        }
-    }
-    // Optional per-ceiling max Z (used when near support interface)
-    for (const auto &pair : g_sawtooth_tops) {
-        if (std::abs(pair.first - current_z_um) <= 150) {
-            top_limit_z = pair.second;
-            break;
-        }
+    auto it_gap = g_sawtooth_gaps.find(current_z_um);
+    if (it_gap != g_sawtooth_gaps.end()) {
+        bottom_z = it_gap->second;
     }
 
     // ONLY bend standard SupportMaterial. Interface layers stay completely flat!
-    if (path_attr.role == ExtrusionRole::SupportMaterial && bottom_z >= 0) {
-        // Default: peak is one layer below the nominal ceiling
-        double true_peak_z = original_peak_z - 0.20;
+    if (path_attr.role == ExtrusionRole::SupportMaterial && bottom_z >= 0.0) {
+        // Planner’s “ceiling” for this support layer
+        double planner_ceiling_z = this->m_last_layer_z;
 
-        // If we have a per-ceiling max, clamp to it so we never poke into interface
-        if (top_limit_z > 0.0)
-            true_peak_z = std::min(true_peak_z, top_limit_z);
+        // Target peak: overshoot above whatever is coming next
+        double true_peak_z = planner_ceiling_z + SAW_TOOTH_OVERSHOOT;
 
-        // Ensure we still have some height above the floor
-        if (true_peak_z <= bottom_z)
-            true_peak_z = bottom_z + 0.05;
+        // Clamp total height so we don't go completely crazy
+        double max_allowed_peak = bottom_z + SAW_TOOTH_MAX_TOTAL;
+        if (true_peak_z > max_allowed_peak)
+            true_peak_z = max_allowed_peak;
+
+        // Ensure some minimal height
+        if (true_peak_z <= bottom_z + SAW_TOOTH_MIN_HEIGHT)
+            true_peak_z = bottom_z + SAW_TOOTH_MIN_HEIGHT;
 
         double gap_height = true_peak_z - bottom_z;
+
         Vec2d prev_exact = this->point_to_gcode(path.front().point);
         auto it = path.begin();
 
-        // Ensure we start exactly at the start point, dropped to the structural floor
         gcode += m_writer.travel_to_xyz(
             Vec3d(prev_exact.x(), prev_exact.y(), bottom_z), "Drop to floor for anchor"
         );
+
+        bool did_anchor = false;
 
 
         for (++it; it != path.end(); ++it) {
@@ -3629,46 +3632,52 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
             double dist_2d_segment = (p_exact - prev_exact).norm();
 
             if (dist_2d_segment > 0.6) {
+                Vec2d seg_start = prev_exact;
+                Vec2d seg_end = p_exact;
+
                 int num_teeth = std::ceil(dist_2d_segment / 5.0);
                 double tooth_width = dist_2d_segment / num_teeth;
-                double ux = (p_exact.x() - prev_exact.x()) / dist_2d_segment;
-                double uy = (p_exact.y() - prev_exact.y()) / dist_2d_segment;
+                double ux = (seg_end.x() - seg_start.x()) / dist_2d_segment;
+                double uy = (seg_end.y() - seg_start.y()) / dist_2d_segment;
 
                 double plateau_dist = tooth_width * 0.30;
                 double slope_dist = tooth_width - plateau_dist;
 
-                // 1. Initial Vertical Anchor Pillar
-                gcode += m_writer.travel_to_xyz(
-                    Vec3d(prev_exact.x(), prev_exact.y(), bottom_z), "Anchor base"
-                );
-                double e_up_anchor = e_per_mm * gap_height * it->e_fraction;
-                gcode += m_writer.extrude_to_xyz(
-                    Vec3d(prev_exact.x(), prev_exact.y(), true_peak_z), e_up_anchor
-                );
+                // 1. Initial Vertical Anchor Pillar – ONLY ONCE PER PATH
+                if (!did_anchor) {
+                    // We are already at (seg_start.x, seg_start.y, bottom_z)
+                    double e_up_anchor = e_per_mm * gap_height * it->e_fraction;
+                    gcode += m_writer.extrude_to_xyz(
+                        Vec3d(seg_start.x(), seg_start.y(), true_peak_z), e_up_anchor
+                    );
+                    did_anchor = true;
+                }
 
+                // 2–4. Sawteeth for this segment (unchanged)
                 for (int i = 0; i < num_teeth; ++i) {
                     double base_offset = i * tooth_width;
 
-                    // 2. THE PLATEAU (Flat across the ceiling to cool)
-                    Vec2d p_plat = prev_exact + Vec2d(ux, uy) * (base_offset + plateau_dist);
+                    // 2. PLATEAU
+                    Vec2d p_plat = seg_start + Vec2d(ux, uy) * (base_offset + plateau_dist);
                     Vec3d p_plat_3d(p_plat.x(), p_plat.y(), true_peak_z);
                     double e_plat = e_per_mm * plateau_dist * it->e_fraction;
                     gcode += m_writer.extrude_to_xyz(p_plat_3d, e_plat);
 
-                    // 3. SLOPE DOWN (Diagonal back to the floor)
-                    Vec2d p_end = prev_exact + Vec2d(ux, uy) * (base_offset + tooth_width);
-                    Vec3d p_end_3d(p_end.x(), p_end.y(), bottom_z);
+                    // 3. SLOPE DOWN
+                    Vec2d p_tooth_end = seg_start + Vec2d(ux, uy) * (base_offset + tooth_width);
+                    Vec3d p_end_3d(p_tooth_end.x(), p_tooth_end.y(), bottom_z);
                     double true_3d_slope = std::sqrt(
                         slope_dist * slope_dist + gap_height * gap_height
                     );
                     double e_slope = e_per_mm * true_3d_slope * it->e_fraction;
                     gcode += m_writer.extrude_to_xyz(p_end_3d, e_slope);
 
-                    // 4. STRAIGHT UP (Pure Vertical Extrusion back to the ceiling)
-                    Vec3d p_peak_up(p_end.x(), p_end.y(), true_peak_z);
+                    // 4. STRAIGHT UP
+                    Vec3d p_peak_up(p_tooth_end.x(), p_tooth_end.y(), true_peak_z);
                     double e_up = e_per_mm * gap_height * it->e_fraction;
                     gcode += m_writer.extrude_to_xyz(p_peak_up, e_up);
                 }
+     
             } else if (dist_2d_segment > 0.001) {
                 // TURNAROUND: Short edge segments stay completely flat at the new clearance ceiling
                 Vec3d target_edge(p_exact.x(), p_exact.y(), true_peak_z);
