@@ -2500,52 +2500,111 @@ void PrintObjectSupportMaterial::generate_base_layers(
 
     this->trim_support_layers_by_object(object, intermediate_layers, m_slicing_params.gap_support_object, m_slicing_params.gap_object_support, m_support_params.gap_xy);
     
- // --- BEGIN NON-PLANAR DYNAMIC HACK V5 ---
-    int target_planar_layers = 2; // Flat layers to stick to the bed
+ // --- BEGIN NON-PLANAR DYNAMIC HACK V8 ---
+    int target_planar_layers = 2;
     double max_gap = 2.5;
 
     std::vector<bool> keep_layer(intermediate_layers.size(), true);
     std::vector<bool> is_sawtooth(intermediate_layers.size(), false);
     std::vector<double> gap_floors(intermediate_layers.size(), 0.0);
 
-    double current_floor = intermediate_layers.empty() ? 0 : intermediate_layers[0]->bottom_z;
-    int planar_count = 0;
+    // Helper: Get Bounding Box of a layer to track pillars geometrically
+    auto get_bbox = [](SupportGeneratorLayer *l) {
+        double min_x = 1e9, min_y = 1e9, max_x = -1e9, max_y = -1e9;
+        for (const Slic3r::Polygon &p : l->polygons) {
+            for (const Slic3r::Point &pt : p.points) {
+                double px = unscale<double>(pt.x());
+                double py = unscale<double>(pt.y());
+                if (px < min_x)
+                    min_x = px;
+                if (py < min_y)
+                    min_y = py;
+                if (px > max_x)
+                    max_x = px;
+                if (py > max_y)
+                    max_y = py;
+            }
+        }
+        return std::make_tuple(min_x, min_y, max_x, max_y);
+    };
 
-    // PASS 1: Lookahead without minimums
+    auto bboxes_intersect = [](const auto &b1, const auto &b2) {
+        return !(
+            std::get<0>(b1) > std::get<2>(b2) + 1.0 || std::get<2>(b1) < std::get<0>(b2) - 1.0 ||
+            std::get<1>(b1) > std::get<3>(b2) + 1.0 || std::get<3>(b1) < std::get<1>(b2) - 1.0
+        );
+    };
+
+    std::vector<size_t> valid_indices;
     for (size_t i = 0; i < intermediate_layers.size(); ++i) {
-        SupportGeneratorLayer *layer = intermediate_layers[i];
-        bool is_last = (i == intermediate_layers.size() - 1);
-
-        if (planar_count < target_planar_layers) {
-            keep_layer[i] = true;
-            is_sawtooth[i] = false;
-            current_floor = layer->print_z;
-            planar_count++;
+        if (!intermediate_layers[i]->polygons.empty()) {
+            valid_indices.push_back(i);
         } else {
-            double gap = layer->print_z - current_floor;
+            keep_layer[i] = false;
+        }
+    }
 
-            // Trigger if we hit the max height OR the interface ceiling
-            if (gap >= max_gap - EPSILON || is_last) {
-                // VALID SAWTOOTH! Tag the ceiling.
+    if (!valid_indices.empty()) {
+        double current_floor = intermediate_layers[valid_indices[0]]->bottom_z;
+        int planar_count = 0;
+
+        for (size_t idx = 0; idx < valid_indices.size();) {
+            size_t i = valid_indices[idx];
+            SupportGeneratorLayer *layer = intermediate_layers[i];
+
+            if (planar_count < target_planar_layers) {
                 keep_layer[i] = true;
-                is_sawtooth[i] = true;
-                gap_floors[i] = current_floor;
-
-                // Confirm deletion of all the empty air layers below it
-                for (size_t k = i - 1;
-                     k > 0 && intermediate_layers[k]->print_z > current_floor + EPSILON; --k) {
-                    keep_layer[k] = false;
-                }
+                is_sawtooth[i] = false;
                 current_floor = layer->print_z;
-                planar_count = 0;
+                planar_count++;
+                idx++;
             } else {
-                // Growing gap, tentatively delete.
-                keep_layer[i] = false;
+                auto bbox = get_bbox(layer);
+                size_t ceiling_idx = idx;
+
+                // Lookahead to find when the gap reaches max height OR the pillar physically ends
+                for (size_t look = idx + 1; look < valid_indices.size(); ++look) {
+                    size_t look_i = valid_indices[look];
+                    SupportGeneratorLayer *look_layer = intermediate_layers[look_i];
+                    auto look_bbox = get_bbox(look_layer);
+
+                    if (!bboxes_intersect(bbox, look_bbox)) {
+                        break; // Pillar geometrically ended here! Force a ceiling.
+                    }
+
+                    ceiling_idx = look;
+                    if (look_layer->print_z - current_floor >= max_gap - EPSILON) {
+                        break; // Reached perfect 2.5mm sawtooth height
+                    }
+                }
+
+                size_t c_i = valid_indices[ceiling_idx];
+                double gap_height = intermediate_layers[c_i]->print_z - current_floor;
+
+                if (gap_height < 0.4) {
+                    keep_layer[c_i] = true;
+                    is_sawtooth[c_i] = false;
+                    current_floor = intermediate_layers[c_i]->print_z;
+                    planar_count++;
+                } else {
+                    keep_layer[c_i] = true;
+                    is_sawtooth[c_i] = true;
+                    gap_floors[c_i] = current_floor;
+
+                    // Delete empty air layers in between
+                    for (size_t del = idx; del < ceiling_idx; ++del) {
+                        keep_layer[valid_indices[del]] = false;
+                    }
+
+                    current_floor = intermediate_layers[c_i]->print_z;
+                    planar_count = 0;
+                }
+                idx = ceiling_idx + 1;
             }
         }
     }
 
-    // PASS 2: Execute Deletions & Track Spatial Coordinates
+    // 3. Track Spatial Coordinates
     for (size_t i = 0; i < intermediate_layers.size(); ++i) {
         SupportGeneratorLayer *layer = intermediate_layers[i];
         if (!keep_layer[i]) {
@@ -2567,13 +2626,11 @@ void PrintObjectSupportMaterial::generate_base_layers(
                     cx /= pts;
                     cy /= pts;
                 }
-
-                // Format: Floor Z, Peak Z, Centroid X, Centroid Y
                 g_sawtooth_gaps.emplace_back(gap_floors[i], layer->print_z, cx, cy);
             }
         }
     }
-    // --- END NON-PLANAR DYNAMIC HACK V5 ---
+    // --- END NON-PLANAR DYNAMIC HACK V8 ---
 }
 
 void PrintObjectSupportMaterial::trim_support_layers_by_object(
