@@ -104,10 +104,8 @@ extern std::map<int, double> g_sawtooth_gaps;
 extern std::map<int, double> g_sawtooth_tops; // new
 
 
-static constexpr double SAW_TOOTH_OVERSHOOT = 0.50; // how far above the planner’s ceiling we go (mm)
+static constexpr double SAW_TOOTH_OVERSHOOT = 0.20; // teeth poke this far above the squish plane
 static constexpr double SAW_TOOTH_MIN_HEIGHT = 0.05;
-static constexpr double SAW_TOOTH_MAX_TOTAL = 2.50; // floor-to-peak max, adjust if needed
-
 
 namespace Slic3r {
 
@@ -3601,17 +3599,14 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
     // ONLY bend standard SupportMaterial. Interface layers stay completely flat!
     if (path_attr.role == ExtrusionRole::SupportMaterial && bottom_z >= 0.0) {
         // Planner’s “ceiling” for this support layer
-        double planner_ceiling_z = this->m_last_layer_z;
+        // squish_z: the planar squish layer prints at the planner's ceiling for this layer
+        // true_peak_z: teeth overshoot above the squish plane by SAW_TOOTH_OVERSHOOT
+        // This way squish layers collide with and flatten the tooth tips, giving a clean
+        // consistent base for the next sandwich — same idea as your IRIT h+0.5 design.
+        double squish_z = this->m_last_layer_z;
+        double true_peak_z = squish_z + SAW_TOOTH_OVERSHOOT;
 
-        // Target peak: overshoot above whatever is coming next
-        double true_peak_z = planner_ceiling_z + SAW_TOOTH_OVERSHOOT;
-
-        // Clamp total height so we don't go completely crazy
-        double max_allowed_peak = bottom_z + SAW_TOOTH_MAX_TOTAL;
-        if (true_peak_z > max_allowed_peak)
-            true_peak_z = max_allowed_peak;
-
-        // Ensure some minimal height
+        // Never let the peak go below the floor by a meaningful amount
         if (true_peak_z <= bottom_z + SAW_TOOTH_MIN_HEIGHT)
             true_peak_z = bottom_z + SAW_TOOTH_MIN_HEIGHT;
 

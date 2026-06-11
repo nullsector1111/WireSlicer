@@ -2502,14 +2502,13 @@ void PrintObjectSupportMaterial::generate_base_layers(
     this->trim_support_layers_by_object(object, intermediate_layers, m_slicing_params.gap_support_object, m_slicing_params.gap_object_support, m_support_params.gap_xy);
     
 // --- BEGIN NON-PLANAR DYNAMIC HACK V9 ---
-    int target_planar_layers = 2; // Flat layers to squish the previous teeth
+    int target_planar_layers = 2;
     double max_gap = 2.5;
 
     std::vector<bool> keep_layer(intermediate_layers.size(), true);
     std::vector<bool> is_sawtooth(intermediate_layers.size(), false);
     std::vector<double> gap_floors(intermediate_layers.size(), 0.0);
 
-    // Helper: total 2D area of all support plastic on this layer
     auto get_area = [](SupportGeneratorLayer *l) {
         double a = 0.0;
         for (const Slic3r::Polygon &p : l->polygons)
@@ -2517,7 +2516,24 @@ void PrintObjectSupportMaterial::generate_base_layers(
         return a;
     };
 
-    // Collect only layers that actually have support polygons
+    // Build sorted list of interface bottom Zs from top_contacts
+    std::vector<double> interface_bottoms;
+    interface_bottoms.reserve(top_contacts.size());
+    for (const auto *lc : top_contacts) {
+        if (lc && !lc->polygons.empty())
+            interface_bottoms.push_back(lc->bottom_z);
+    }
+    std::sort(interface_bottoms.begin(), interface_bottoms.end());
+
+    // Returns nearest interface bottom_z strictly above floor_z, or -1 if none
+    auto nearest_interface_above = [&](double floor_z) -> double {
+        for (double ibz : interface_bottoms) {
+            if (ibz > floor_z + EPSILON)
+                return ibz;
+        }
+        return -1.0;
+    };
+
     std::vector<size_t> valid_indices;
     for (size_t i = 0; i < intermediate_layers.size(); ++i) {
         if (!intermediate_layers[i]->polygons.empty())
@@ -2539,7 +2555,6 @@ void PrintObjectSupportMaterial::generate_base_layers(
             double next_area = is_last ? 0.0 : get_area(intermediate_layers[valid_indices[idx + 1]]);
 
             if (planar_count < target_planar_layers) {
-                // First N layers above the floor stay planar (squish layers)
                 keep_layer[i] = true;
                 is_sawtooth[i] = false;
                 current_floor = layer->print_z;
@@ -2547,51 +2562,46 @@ void PrintObjectSupportMaterial::generate_base_layers(
             } else {
                 double gap = layer->print_z - current_floor;
 
-                bool force_last = is_last;
-                bool force_height = (gap >= max_gap - EPSILON);
-                bool force_interface =
-                    (next_area < current_area * 0.85); // area drop => interface ahead
+                // Tighten allowed gap if an interface is closer than max_gap
+                double local_max_gap = max_gap;
+                double iface_z = nearest_interface_above(current_floor);
+                if (iface_z > 0.0) {
+                    // Reserve space for the squish layers above the sawtooth ceiling,
+                    // plus a small clearance so the ceiling doesn't sit on the interface.
+                    const double layer_height = 0.20;
+                    const double tooth_overshoot =
+                        0.20; // must match SAW_TOOTH_OVERSHOOT in gcode.cpp
+                    double reserved = (target_planar_layers * layer_height) + tooth_overshoot +
+                        layer_height;
+                    double iface_dist = iface_z - current_floor - reserved;
+                    if (iface_dist > 0.0 && iface_dist < local_max_gap)
+                        local_max_gap = iface_dist;
+                }
 
-                bool force_ceiling = force_last || force_height || force_interface;
+                bool force_last = is_last;
+                bool force_height = (gap >= local_max_gap - EPSILON);
+                bool force_area_drop = (next_area < current_area * 0.85);
+
+                bool force_ceiling = force_last || force_height || force_area_drop;
 
                 if (force_ceiling) {
-                    // Decide which layer becomes the sawtooth ceiling:
-                    // - normal case (height/last): current layer 'i'
-                    // - interface case: previous support layer becomes the ceiling,
-                    //   and this current layer stays planar as the flat cap under the interface.
-                    size_t ceiling_valid_idx = idx;
-                    if (force_interface && idx > 0)
-                        ceiling_valid_idx = idx - 1;
+                    // This layer becomes the sawtooth ceiling
+                    keep_layer[i] = true;
+                    is_sawtooth[i] = true;
+                    gap_floors[i] = current_floor;
 
-                    size_t ceiling_layer_idx = valid_indices[ceiling_valid_idx];
-                    auto *ceiling_layer = intermediate_layers[ceiling_layer_idx];
-
-                    keep_layer[ceiling_layer_idx] = true;
-                    is_sawtooth[ceiling_layer_idx] = true;
-                    gap_floors[ceiling_layer_idx] = current_floor;
-
-                    // Current layer: keep it planar if it is above the ceiling
-                    if (ceiling_layer_idx != i) {
-                        keep_layer[i] = true;
-                        is_sawtooth[i] = false;
-                    }
-
-                    // Delete “air” layers between floor and this ceiling
-                    for (size_t search_idx = ceiling_valid_idx; search_idx > 0; --search_idx) {
-                        size_t k = valid_indices[search_idx - 1];
+                    // Delete air layers between floor and this ceiling
+                    for (size_t s = idx; s > 0; --s) {
+                        size_t k = valid_indices[s - 1];
                         if (intermediate_layers[k]->print_z <= current_floor + EPSILON)
                             break;
-                        if (k == ceiling_layer_idx)
-                            continue;
                         keep_layer[k] = false;
                     }
 
-                    // Start a new sandwich from the highest solid layer we have here.
-                    // We want the next sandwich to sit on the current (possibly planar cap) layer.
+                    // Next sandwich starts from this ceiling
                     current_floor = layer->print_z;
                     planar_count = 0;
                 } else {
-                    // Candidate non-planar layers are tentatively deleted
                     keep_layer[i] = false;
                 }
             }
