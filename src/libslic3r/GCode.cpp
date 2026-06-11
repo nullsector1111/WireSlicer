@@ -66,6 +66,8 @@
 #include <boost/nowide/cstdio.hpp>
 #include <boost/nowide/cstdlib.hpp>
 
+#include "NonPlanarConfig.h"
+
 #include "SVG.hpp"
 
 #include <tbb/parallel_for.h>
@@ -104,8 +106,9 @@ extern std::map<int, double> g_sawtooth_gaps;
 extern std::map<int, double> g_sawtooth_tops; // new
 
 
-static constexpr double SAW_TOOTH_OVERSHOOT = 0.20; // teeth poke this far above the squish plane
-static constexpr double SAW_TOOTH_MIN_HEIGHT = 0.05;
+//static constexpr double SAW_TOOTH_OVERSHOOT = 0.50; // teeth poke this far above the squish plane
+//static constexpr double SAW_TOOTH_MIN_HEIGHT = 0.05;
+//static constexpr double SAW_TOOTH_MAX_HEIGHT = 2.50; // max sandwich height before forcing a ceiling
 
 namespace Slic3r {
 
@@ -3588,6 +3591,8 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
 // --- BEGIN NON-PLANAR TOOLPATH INJECTION V12 ---
     double original_peak_z = this->m_last_layer_z;
     double bottom_z = -1.0;
+    // Get support material speed in mm/min for G1 moves
+    double support_f = m_config.support_material_speed.value * 60.0;
 
     // Look for an exact ceiling tag for this layer
     int current_z_um = std::round(original_peak_z * 1000.0);
@@ -3615,10 +3620,14 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
         Vec2d prev_exact = this->point_to_gcode(path.front().point);
         auto it = path.begin();
 
+        // Set support material speed for all sawtooth extrusions
+        gcode += m_writer.set_speed(m_config.support_material_speed.value * 60.0, "", "");
+
         gcode += m_writer.travel_to_xyz(
             Vec3d(prev_exact.x(), prev_exact.y(), bottom_z), "Drop to floor for anchor"
         );
-
+        // Force feedrate for all subsequent G1 extrusions in this block
+        gcode += "G1 F" + std::to_string((int) support_f) + "\n";
         bool did_anchor = false;
 
 
@@ -3681,6 +3690,8 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
             }
             prev_exact = p_exact;
         }
+        // Restore feedrate to support material speed (normal pipeline will override as needed)
+        gcode += "G1 F" + std::to_string((int) support_f) + "\n";
 
         if (m_enable_cooling_markers)
             gcode += ";_EXTRUDE_END\n";

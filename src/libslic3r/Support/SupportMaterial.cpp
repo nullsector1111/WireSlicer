@@ -52,6 +52,8 @@
 #include "libslic3r/TriangleSelector.hpp"
 #include "tcbspan/span.hpp"
 
+#include "NonPlanarConfig.h"
+
 #define SUPPORT_USE_AGG_RASTERIZER
 
 #ifdef SUPPORT_USE_AGG_RASTERIZER
@@ -2503,7 +2505,7 @@ void PrintObjectSupportMaterial::generate_base_layers(
     
 // --- BEGIN NON-PLANAR DYNAMIC HACK V9 ---
     int target_planar_layers = 2;
-    double max_gap = 2.5;
+    double max_gap = SAW_TOOTH_MAX_HEIGHT;
 
     std::vector<bool> keep_layer(intermediate_layers.size(), true);
     std::vector<bool> is_sawtooth(intermediate_layers.size(), false);
