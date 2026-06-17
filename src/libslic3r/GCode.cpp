@@ -3647,40 +3647,44 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
                 double plateau_dist = tooth_width * 0.30;
                 double slope_dist = tooth_width - plateau_dist;
 
-                // 1. Initial Vertical Anchor Pillar – ONLY ONCE PER PATH
-                if (!did_anchor) {
-                    // We are already at (seg_start.x, seg_start.y, bottom_z)
-                    double e_up_anchor = e_per_mm * gap_height * it->e_fraction;
-                    gcode += m_writer.extrude_to_xyz(
-                        Vec3d(seg_start.x(), seg_start.y(), true_peak_z), e_up_anchor
-                    );
-                    did_anchor = true;
-                }
+             // 1. Initial Vertical Anchor Pillar – ONLY ONCE PER PATH
+            if (!did_anchor) {
+                double e_up_anchor = e_per_mm * gap_height * it->e_fraction;
+                gcode += "G1 F" + std::to_string((int) (SAW_VERTICAL_SPEED_MMPS * 60.0)) + "\n";
+                gcode += m_writer.extrude_to_xyz(
+                    Vec3d(seg_start.x(), seg_start.y(), true_peak_z), e_up_anchor
+                );
+                gcode += "G1 F" +
+                    std::to_string((int) (m_config.support_material_speed.value * 60.0)) + "\n";
+                did_anchor = true;
+            }
 
-                // 2–4. Sawteeth for this segment (unchanged)
-                for (int i = 0; i < num_teeth; ++i) {
-                    double base_offset = i * tooth_width;
+            for (int i = 0; i < num_teeth; ++i) {
+                double base_offset = i * tooth_width;
 
-                    // 2. PLATEAU
-                    Vec2d p_plat = seg_start + Vec2d(ux, uy) * (base_offset + plateau_dist);
-                    Vec3d p_plat_3d(p_plat.x(), p_plat.y(), true_peak_z);
-                    double e_plat = e_per_mm * plateau_dist * it->e_fraction;
-                    gcode += m_writer.extrude_to_xyz(p_plat_3d, e_plat);
+                // 2. PLATEAU (unchanged speed)
+                Vec2d p_plat = seg_start + Vec2d(ux, uy) * (base_offset + plateau_dist);
+                Vec3d p_plat_3d(p_plat.x(), p_plat.y(), true_peak_z);
+                double e_plat = e_per_mm * plateau_dist * it->e_fraction;
+                gcode += m_writer.extrude_to_xyz(p_plat_3d, e_plat);
 
-                    // 3. SLOPE DOWN
-                    Vec2d p_tooth_end = seg_start + Vec2d(ux, uy) * (base_offset + tooth_width);
-                    Vec3d p_end_3d(p_tooth_end.x(), p_tooth_end.y(), bottom_z);
-                    double true_3d_slope = std::sqrt(
-                        slope_dist * slope_dist + gap_height * gap_height
-                    );
-                    double e_slope = e_per_mm * true_3d_slope * it->e_fraction;
-                    gcode += m_writer.extrude_to_xyz(p_end_3d, e_slope);
+                // 3. SLOPE DOWN (unchanged speed)
+                Vec2d p_tooth_end = seg_start + Vec2d(ux, uy) * (base_offset + tooth_width);
+                Vec3d p_end_3d(p_tooth_end.x(), p_tooth_end.y(), bottom_z);
+                double true_3d_slope = std::sqrt(
+                    slope_dist * slope_dist + gap_height * gap_height
+                );
+                double e_slope = e_per_mm * true_3d_slope * it->e_fraction;
+                gcode += m_writer.extrude_to_xyz(p_end_3d, e_slope);
 
-                    // 4. STRAIGHT UP
-                    Vec3d p_peak_up(p_tooth_end.x(), p_tooth_end.y(), true_peak_z);
-                    double e_up = e_per_mm * gap_height * it->e_fraction;
-                    gcode += m_writer.extrude_to_xyz(p_peak_up, e_up);
-                }
+                // 4. STRAIGHT UP — slow speed
+                Vec3d p_peak_up(p_tooth_end.x(), p_tooth_end.y(), true_peak_z);
+                double e_up = e_per_mm * gap_height * it->e_fraction;
+                gcode += "G1 F" + std::to_string((int) (SAW_VERTICAL_SPEED_MMPS * 60.0)) + "\n";
+                gcode += m_writer.extrude_to_xyz(p_peak_up, e_up);
+                gcode += "G1 F" +
+                    std::to_string((int) (m_config.support_material_speed.value * 60.0)) + "\n";
+            }
      
             } else if (dist_2d_segment > 0.001) {
                 // TURNAROUND: Short edge segments stay completely flat at the new clearance ceiling

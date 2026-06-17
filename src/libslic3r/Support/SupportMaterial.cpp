@@ -2563,20 +2563,24 @@ void PrintObjectSupportMaterial::generate_base_layers(
                 planar_count++;
             } else {
                 double gap = layer->print_z - current_floor;
+                const double layer_height = 0.2;
 
                 // Tighten allowed gap if an interface is closer than max_gap
                 double local_max_gap = max_gap;
+                const double tooth_overshoot = SAW_TOOTH_OVERSHOOT;
+                double reserved = tooth_overshoot +
+                    (target_planar_layers * layer_height); // always 0.6mm
+
                 double iface_z = nearest_interface_above(current_floor);
                 if (iface_z > 0.0) {
-                    // Reserve space for the squish layers above the sawtooth ceiling,
-                    // plus a small clearance so the ceiling doesn't sit on the interface.
-                    const double layer_height = 0.20;
-                    const double tooth_overshoot =
-                        0.20; // must match SAW_TOOTH_OVERSHOOT in gcode.cpp
-                    double reserved = (target_planar_layers * layer_height) + tooth_overshoot +
-                        layer_height;
                     double iface_dist = iface_z - current_floor - reserved;
-                    if (iface_dist > 0.0 && iface_dist < local_max_gap)
+
+                    // Even if iface_dist is negative (interface very close to floor),
+                    // still force a ceiling — just make the sandwich as thin as possible
+                    if (iface_dist < layer_height)
+                        iface_dist = layer_height; // minimum one layer height so ceiling can exist
+
+                    if (iface_dist < local_max_gap)
                         local_max_gap = iface_dist;
                 }
 
