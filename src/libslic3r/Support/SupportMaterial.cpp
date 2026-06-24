@@ -344,7 +344,14 @@ void PrintObjectSupportMaterial::generate(PrintObject &object)
     SupportGeneratorLayersPtr intermediate_layers = this->raft_and_intermediate_support_layers(
         object, bottom_contacts, top_contacts, layer_storage);
 
-    this->trim_support_layers_by_object(object, top_contacts, m_slicing_params.gap_support_object, m_slicing_params.gap_object_support, m_support_params.gap_xy);
+    //this->trim_support_layers_by_object(object, top_contacts, m_slicing_params.gap_support_object, m_slicing_params.gap_object_support, m_support_params.gap_xy);
+
+    this->trim_support_layers_by_object(
+        object,
+        top_contacts,
+        m_slicing_params.gap_support_object,
+        m_slicing_params.gap_object_support, scale_(0.5)
+    );
 
 #ifdef SLIC3R_DEBUG
     for (const SupportGeneratorLayer *layer : top_contacts)
@@ -2112,7 +2119,13 @@ SupportGeneratorLayersPtr PrintObjectSupportMaterial::bottom_contact_layers_and_
     } // over all layers downwards
 
     std::reverse(bottom_contacts.begin(), bottom_contacts.end());
-    trim_support_layers_by_object(object, bottom_contacts, m_slicing_params.gap_support_object, m_slicing_params.gap_object_support, m_support_params.gap_xy);
+    /*trim_support_layers_by_object(object, bottom_contacts, m_slicing_params.gap_support_object, m_slicing_params.gap_object_support, m_support_params.gap_xy);*/
+    trim_support_layers_by_object(
+        object, 
+        bottom_contacts,
+        m_slicing_params.gap_support_object,
+        m_slicing_params.gap_object_support, scale_(0.5)
+    );
     return bottom_contacts;
 }
 
