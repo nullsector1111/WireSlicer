@@ -102,7 +102,16 @@ using namespace std::literals::string_view_literals;
 #include <set>
 extern std::set<int> g_sawtooth_z_heights;
 #include <map>
-extern std::map<int, double> g_sawtooth_gaps;
+//extern std::map<int, double> g_sawtooth_gaps;
+
+struct SawtoothRegion
+{
+    Slic3r::Polygon poly;
+    double floor_z;
+};
+
+extern std::map<int, std::vector<SawtoothRegion>> g_sawtooth_regions;
+
 extern std::map<int, double> g_sawtooth_tops; // new
 
 
@@ -3594,11 +3603,32 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
     // Get support material speed in mm/min for G1 moves
     double support_f = m_config.support_material_speed.value * 60.0;
 
-    // Look for an exact ceiling tag for this layer
+    // Look for a sawtooth region matching this exact path on this layer
     int current_z_um = std::round(original_peak_z * 1000.0);
-    auto it_gap = g_sawtooth_gaps.find(current_z_um);
-    if (it_gap != g_sawtooth_gaps.end()) {
-        bottom_z = it_gap->second;
+    
+
+    auto it_regions = g_sawtooth_regions.find(current_z_um);
+    if (it_regions != g_sawtooth_regions.end() && !path.empty()) {
+        BoundingBox path_bb;
+        for (const auto &pt : path) {
+            path_bb.merge(pt.point);
+        }
+        path_bb.offset(scale_(0.05));
+
+        for (const SawtoothRegion &r : it_regions->second) {
+            BoundingBox region_bb = get_extents(r.poly);
+            region_bb.offset(scale_(0.05));
+
+            bool overlap = !(
+                path_bb.max.x() < region_bb.min.x() || region_bb.max.x() < path_bb.min.x() ||
+                path_bb.max.y() < region_bb.min.y() || region_bb.max.y() < path_bb.min.y()
+            );
+
+            if (overlap) {
+                bottom_z = r.floor_z;
+                break;
+            }
+        }
     }
 
     // ONLY bend standard SupportMaterial. Interface layers stay completely flat!

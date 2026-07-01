@@ -86,7 +86,15 @@ std::set<int> g_sawtooth_z_heights;
 #include <map>
 #include <cmath>
 // Key: Ceiling Z in microns, Value: Floor Z
-std::map<int, double> g_sawtooth_gaps; // already there
+//std::map<int, double> g_sawtooth_gaps; // already there
+struct SawtoothRegion
+{
+    Slic3r::Polygon poly;
+    double floor_z;
+};
+
+std::map<int, std::vector<SawtoothRegion>> g_sawtooth_regions;
+
 std::map<int, double> g_sawtooth_tops; // NEW: per-ceiling max Z for teeth
 
 using namespace Slic3r::FFFSupport;
@@ -2516,132 +2524,210 @@ void PrintObjectSupportMaterial::generate_base_layers(
 
     this->trim_support_layers_by_object(object, intermediate_layers, m_slicing_params.gap_support_object, m_slicing_params.gap_object_support, m_support_params.gap_xy);
     
-// --- BEGIN NON-PLANAR DYNAMIC HACK V9 ---
+// --- BEGIN NON-PLANAR DYNAMIC HACK V10 PER-PILLAR ---
     int target_planar_layers = 2;
     double max_gap = SAW_TOOTH_MAX_HEIGHT;
+    const double layer_height = 0.2;
 
-    std::vector<bool> keep_layer(intermediate_layers.size(), true);
-    std::vector<bool> is_sawtooth(intermediate_layers.size(), false);
-    std::vector<double> gap_floors(intermediate_layers.size(), 0.0);
-
-    auto get_area = [](SupportGeneratorLayer *l) {
-        double a = 0.0;
-        for (const Slic3r::Polygon &p : l->polygons)
-            a += std::abs(p.area());
-        return a;
+    struct PillarPiece
+    {
+        Slic3r::Polygon poly;
+        bool keep = false;
+        bool is_sawtooth = false;
+        double floor_z = 0.0;
+        int track_id = -1;
     };
 
-    // Build sorted list of interface bottom Zs from top_contacts
-    std::vector<double> interface_bottoms;
-    interface_bottoms.reserve(top_contacts.size());
-    for (const auto *lc : top_contacts) {
-        if (lc && !lc->polygons.empty())
-            interface_bottoms.push_back(lc->bottom_z);
-    }
-    std::sort(interface_bottoms.begin(), interface_bottoms.end());
+    struct TrackNode
+    {
+        size_t layer_idx;
+        size_t piece_idx;
+    };
 
-    // Returns nearest interface bottom_z strictly above floor_z, or -1 if none
-    auto nearest_interface_above = [&](double floor_z) -> double {
-        for (double ibz : interface_bottoms) {
-            if (ibz > floor_z + EPSILON)
-                return ibz;
+    auto poly_area = [](const Slic3r::Polygon &p) -> double { return std::abs(p.area()); };
+
+    auto polys_match = [](const Slic3r::Polygon &a, const Slic3r::Polygon &b) -> bool {
+        BoundingBox ba = get_extents(a);
+        BoundingBox bb = get_extents(b);
+
+        // Small tolerance so nearly-aligned pillars still match.
+        ba.offset(scale_(0.05));
+        bb.offset(scale_(0.05));
+
+        return !(
+            ba.max.x() < bb.min.x() || bb.max.x() < ba.min.x() || ba.max.y() < bb.min.y() ||
+            bb.max.y() < ba.min.y()
+        );
+    };
+
+    auto nearest_interface_above = [&](const Slic3r::Polygon &ref_poly, double floor_z) -> double {
+        double best = -1.0;
+        for (const auto *lc : top_contacts) {
+            if (lc == nullptr || lc->polygons.empty())
+                continue;
+            if (lc->bottom_z <= floor_z + EPSILON)
+                continue;
+
+            for (const Slic3r::Polygon &tp : lc->polygons) {
+                if (polys_match(ref_poly, tp)) {
+                    if (best < 0.0 || lc->bottom_z < best)
+                        best = lc->bottom_z;
+                    break;
+                }
+            }
         }
-        return -1.0;
+        return best;
     };
 
-    std::vector<size_t> valid_indices;
+    // Split every support layer into separate polygon pieces.
+    std::vector<std::vector<PillarPiece>> pieces(intermediate_layers.size());
     for (size_t i = 0; i < intermediate_layers.size(); ++i) {
-        if (!intermediate_layers[i]->polygons.empty())
-            valid_indices.push_back(i);
-        else
-            keep_layer[i] = false;
+        for (const Slic3r::Polygon &p : intermediate_layers[i]->polygons) {
+            PillarPiece pc;
+            pc.poly = p;
+            pieces[i].push_back(std::move(pc));
+        }
     }
 
-    if (!valid_indices.empty()) {
-        double current_floor = intermediate_layers[valid_indices[0]]->bottom_z;
+    // Build vertical "tracks" by matching polygons between adjacent non-empty layers.
+    int next_track_id = 0;
+    std::map<int, std::vector<TrackNode>> tracks;
+
+    std::ptrdiff_t prev_nonempty = -1;
+    for (size_t i = 0; i < pieces.size(); ++i) {
+        if (pieces[i].empty())
+            continue;
+
+        if (prev_nonempty < 0) {
+            for (size_t j = 0; j < pieces[i].size(); ++j) {
+                pieces[i][j].track_id = next_track_id;
+                tracks[next_track_id].push_back({i, j});
+                ++next_track_id;
+            }
+        } else {
+            for (size_t j = 0; j < pieces[i].size(); ++j) {
+                int found_track = -1;
+
+                for (size_t k = 0; k < pieces[(size_t) prev_nonempty].size(); ++k) {
+                    if (pieces[(size_t) prev_nonempty][k].track_id < 0)
+                        continue;
+
+                    if (polys_match(pieces[i][j].poly, pieces[(size_t) prev_nonempty][k].poly)) {
+                        found_track = pieces[(size_t) prev_nonempty][k].track_id;
+                        break;
+                    }
+                }
+
+                if (found_track < 0)
+                    found_track = next_track_id++;
+
+                pieces[i][j].track_id = found_track;
+                tracks[found_track].push_back({i, j});
+            }
+        }
+
+        prev_nonempty = (std::ptrdiff_t) i;
+    }
+
+    // Run your sandwich logic independently for each track.
+    for (auto &kv : tracks) {
+        std::vector<TrackNode> &nodes = kv.second;
+        if (nodes.empty())
+            continue;
+
+        std::sort(nodes.begin(), nodes.end(), [&](const TrackNode &a, const TrackNode &b) {
+            return intermediate_layers[a.layer_idx]->print_z <
+                intermediate_layers[b.layer_idx]->print_z;
+        });
+
+        double current_floor = intermediate_layers[nodes.front().layer_idx]->bottom_z;
         int planar_count = 0;
 
-        for (size_t idx = 0; idx < valid_indices.size(); ++idx) {
-            size_t i = valid_indices[idx];
-            auto *layer = intermediate_layers[i];
-            bool is_last = (idx == valid_indices.size() - 1);
+        for (size_t n = 0; n < nodes.size(); ++n) {
+            size_t layer_idx = nodes[n].layer_idx;
+            size_t piece_idx = nodes[n].piece_idx;
+            auto *layer = intermediate_layers[layer_idx];
+            PillarPiece &pc = pieces[layer_idx][piece_idx];
 
-            double current_area = get_area(layer);
-            double next_area = is_last ? 0.0 : get_area(intermediate_layers[valid_indices[idx + 1]]);
+            bool is_last = (n == nodes.size() - 1);
+
+            double current_area = poly_area(pc.poly);
+            double next_area = 0.0;
+            if (!is_last) {
+                const TrackNode &nn = nodes[n + 1];
+                next_area = poly_area(pieces[nn.layer_idx][nn.piece_idx].poly);
+            }
 
             if (planar_count < target_planar_layers) {
-                keep_layer[i] = true;
-                is_sawtooth[i] = false;
+                pc.keep = true;
+                pc.is_sawtooth = false;
                 current_floor = layer->print_z;
                 planar_count++;
             } else {
                 double gap = layer->print_z - current_floor;
-                const double layer_height = 0.2;
 
-                // Tighten allowed gap if an interface is closer than max_gap
                 double local_max_gap = max_gap;
-                const double tooth_overshoot = SAW_TOOTH_OVERSHOOT;
-                double reserved = tooth_overshoot +
-                    (target_planar_layers * layer_height); // always 0.6mm
+                double reserved = SAW_TOOTH_OVERSHOOT + (target_planar_layers * layer_height);
 
-                double iface_z = nearest_interface_above(current_floor);
+                double iface_z = nearest_interface_above(pc.poly, current_floor);
                 if (iface_z > 0.0) {
                     double iface_dist = iface_z - current_floor - reserved;
-
-                    // Even if iface_dist is negative (interface very close to floor),
-                    // still force a ceiling — just make the sandwich as thin as possible
                     if (iface_dist < layer_height)
-                        iface_dist = layer_height; // minimum one layer height so ceiling can exist
-
+                        iface_dist = layer_height;
                     if (iface_dist < local_max_gap)
                         local_max_gap = iface_dist;
                 }
 
                 bool force_last = is_last;
                 bool force_height = (gap >= local_max_gap - EPSILON);
-                bool force_area_drop = (next_area < current_area * 0.85);
+                bool force_area_drop = (!is_last && next_area < current_area * 0.85);
 
                 bool force_ceiling = force_last || force_height || force_area_drop;
 
                 if (force_ceiling) {
-                    // This layer becomes the sawtooth ceiling
-                    keep_layer[i] = true;
-                    is_sawtooth[i] = true;
-                    gap_floors[i] = current_floor;
+                    pc.keep = true;
+                    pc.is_sawtooth = true;
+                    pc.floor_z = current_floor;
 
-                    // Delete air layers between floor and this ceiling
-                    for (size_t s = idx; s > 0; --s) {
-                        size_t k = valid_indices[s - 1];
-                        if (intermediate_layers[k]->print_z <= current_floor + EPSILON)
+                    // Remove only the "air layers" in THIS SAME TRACK above current_floor.
+                    for (size_t s = n; s > 0; --s) {
+                        const TrackNode &prev = nodes[s - 1];
+                        if (intermediate_layers[prev.layer_idx]->print_z <= current_floor + EPSILON)
                             break;
-                        keep_layer[k] = false;
+                        pieces[prev.layer_idx][prev.piece_idx].keep = false;
                     }
 
-                    // Next sandwich starts from this ceiling
                     current_floor = layer->print_z;
                     planar_count = 0;
                 } else {
-                    keep_layer[i] = false;
+                    pc.keep = false;
                 }
             }
         }
     }
 
-    // Apply deletions and map sawtooth ceilings into g_sawtooth_gaps
+    // Rebuild support polygons and export per-region floor mapping.
+    g_sawtooth_regions.clear();
+
     for (size_t i = 0; i < intermediate_layers.size(); ++i) {
         auto *layer = intermediate_layers[i];
-        if (!keep_layer[i]) {
-            layer->polygons.clear();
-            layer->is_nonplanar_sawtooth = false;
-        } else {
-            layer->is_nonplanar_sawtooth = is_sawtooth[i];
-            if (is_sawtooth[i]) {
+        layer->polygons.clear();
+        layer->is_nonplanar_sawtooth = false;
+
+        for (const PillarPiece &pc : pieces[i]) {
+            if (!pc.keep)
+                continue;
+
+            layer->polygons.push_back(pc.poly);
+
+            if (pc.is_sawtooth) {
+                layer->is_nonplanar_sawtooth = true;
                 int z_key = std::round(layer->print_z * 1000.0);
-                g_sawtooth_gaps[z_key] = gap_floors[i];
+                g_sawtooth_regions[z_key].push_back({pc.poly, pc.floor_z});
             }
         }
     }
-    // --- END NON-PLANAR DYNAMIC HACK V9 ---
+    // --- END NON-PLANAR DYNAMIC HACK V10 PER-PILLAR ---
 }
 
 void PrintObjectSupportMaterial::trim_support_layers_by_object(
