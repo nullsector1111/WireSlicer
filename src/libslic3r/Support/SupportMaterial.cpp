@@ -2700,7 +2700,8 @@ void PrintObjectSupportMaterial::generate_base_layers(
                     current_floor = layer->print_z;
                     planar_count = 0;
                 } else {
-                    pc.keep = false;
+                    pc.keep = true;
+                    pc.is_sawtooth = false;
                 }
             }
         }

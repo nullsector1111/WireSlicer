@@ -3669,12 +3669,12 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
                 Vec2d seg_start = prev_exact;
                 Vec2d seg_end = p_exact;
 
-                int num_teeth = std::ceil(dist_2d_segment / 5.0);
+                int num_teeth = std::ceil(dist_2d_segment / 6);
                 double tooth_width = dist_2d_segment / num_teeth;
                 double ux = (seg_end.x() - seg_start.x()) / dist_2d_segment;
                 double uy = (seg_end.y() - seg_start.y()) / dist_2d_segment;
 
-                double plateau_dist = tooth_width * 0.30;
+                double plateau_dist = tooth_width * 0.40;
                 double slope_dist = tooth_width - plateau_dist;
 
              // 1. Initial Vertical Anchor Pillar – ONLY ONCE PER PATH
@@ -3698,13 +3698,15 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
                 double e_plat = e_per_mm * plateau_dist * it->e_fraction;
                 gcode += m_writer.extrude_to_xyz(p_plat_3d, e_plat);
 
-                // 3. SLOPE DOWN (unchanged speed)
+                // 3. SLOPE DOWN
+                // e_per_mm was computed by the planar slicer for XY distance.
+                // Use horizontal projected distance here: the firmware synchronizes
+                // X/Y/Z/E, but the deposited bead volume should not jump merely
+                // because this custom path also changes Z.
                 Vec2d p_tooth_end = seg_start + Vec2d(ux, uy) * (base_offset + tooth_width);
                 Vec3d p_end_3d(p_tooth_end.x(), p_tooth_end.y(), bottom_z);
-                double true_3d_slope = std::sqrt(
-                    slope_dist * slope_dist + gap_height * gap_height
-                );
-                double e_slope = e_per_mm * true_3d_slope * it->e_fraction;
+                constexpr double SAW_DOWNHILL_FLOW_MULT = 1.10;
+                double e_slope = e_per_mm * slope_dist * SAW_DOWNHILL_FLOW_MULT * it->e_fraction;
                 gcode += m_writer.extrude_to_xyz(p_end_3d, e_slope);
 
                 // 4. STRAIGHT UP — slow speed
