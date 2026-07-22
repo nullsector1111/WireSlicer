@@ -3598,6 +3598,7 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
     }
 
 // --- BEGIN NON-PLANAR TOOLPATH INJECTION V12 ---
+    constexpr int SAW_TOP_SETTLE_MS = 80; // Start with 50–100 ms
     double original_peak_z = this->m_last_layer_z;
     double bottom_z = -1.0;
     // Get support material speed in mm/min for G1 moves
@@ -3660,6 +3661,12 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
         gcode += "G1 F" + std::to_string((int) support_f) + "\n";
         bool did_anchor = false;
 
+        // Keep only the two most recent sawtooth tip positions.
+        // At the end, close the last pillar to the immediately preceding tip.
+        Vec3d previous_peak_point;
+        Vec3d last_peak_point;
+        bool have_previous_peak = false;
+        bool have_last_peak = false;
 
         for (++it; it != path.end(); ++it) {
             Vec2d p_exact = this->point_to_gcode(it->point);
@@ -3680,12 +3687,15 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
              // 1. Initial Vertical Anchor Pillar – ONLY ONCE PER PATH
             if (!did_anchor) {
                 double e_up_anchor = e_per_mm * gap_height * it->e_fraction;
+
+                Vec3d anchor_peak(seg_start.x(), seg_start.y(), true_peak_z);
+
                 gcode += "G1 F" + std::to_string((int) (SAW_VERTICAL_SPEED_MMPS * 60.0)) + "\n";
-                gcode += m_writer.extrude_to_xyz(
-                    Vec3d(seg_start.x(), seg_start.y(), true_peak_z), e_up_anchor
-                );
+                gcode += m_writer.extrude_to_xyz(anchor_peak, e_up_anchor);
+
                 gcode += "G1 F" +
                     std::to_string((int) (m_config.support_material_speed.value * 60.0)) + "\n";
+
                 did_anchor = true;
             }
 
@@ -3705,17 +3715,36 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
                 // because this custom path also changes Z.
                 Vec2d p_tooth_end = seg_start + Vec2d(ux, uy) * (base_offset + tooth_width);
                 Vec3d p_end_3d(p_tooth_end.x(), p_tooth_end.y(), bottom_z);
-                constexpr double SAW_DOWNHILL_FLOW_MULT = 1.10;
+                constexpr double SAW_DOWNHILL_FLOW_MULT = 1.00;
                 double e_slope = e_per_mm * slope_dist * SAW_DOWNHILL_FLOW_MULT * it->e_fraction;
                 gcode += m_writer.extrude_to_xyz(p_end_3d, e_slope);
 
                 // 4. STRAIGHT UP — slow speed
                 Vec3d p_peak_up(p_tooth_end.x(), p_tooth_end.y(), true_peak_z);
+                // Shift the current last tip into previous tip, then save the new last tip.
+                if (have_last_peak) {
+                    previous_peak_point = last_peak_point;
+                    have_previous_peak = true;
+                }
+
+                last_peak_point = p_peak_up;
+                have_last_peak = true;
                 double e_up = e_per_mm * gap_height * it->e_fraction;
+
                 gcode += "G1 F" + std::to_string((int) (SAW_VERTICAL_SPEED_MMPS * 60.0)) + "\n";
                 gcode += m_writer.extrude_to_xyz(p_peak_up, e_up);
+
+                // Let the fresh vertical pillar stiffen before the next sideways move.
+                gcode += "G4 P" + std::to_string(SAW_TOP_SETTLE_MS) + "\n";
+
                 gcode += "G1 F" +
                     std::to_string((int) (m_config.support_material_speed.value * 60.0)) + "\n";
+
+                
+
+
+
+
             }
      
             } else if (dist_2d_segment > 0.001) {
@@ -3725,6 +3754,20 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
                 gcode += m_writer.extrude_to_xyz(target_edge, e_edge);
             }
             prev_exact = p_exact;
+        }
+        // Close ONLY the final pillar to the sawtooth tip immediately before it.
+        if (have_previous_peak && have_last_peak) {
+            Vec2d close_xy_a(last_peak_point.x(), last_peak_point.y());
+            Vec2d close_xy_b(previous_peak_point.x(), previous_peak_point.y());
+            double close_dist = (close_xy_b - close_xy_a).norm();
+
+            if (close_dist > 0.01) {
+                constexpr double SAW_FINAL_CLOSE_FLOW_MULT = 0.50;
+
+                double e_close = e_per_mm * close_dist * SAW_FINAL_CLOSE_FLOW_MULT;
+
+                gcode += m_writer.extrude_to_xyz(previous_peak_point, e_close);
+            }
         }
         // Restore feedrate to support material speed (normal pipeline will override as needed)
         gcode += "G1 F" + std::to_string((int) support_f) + "\n";
