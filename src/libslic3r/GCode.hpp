@@ -110,6 +110,12 @@ public:
     GCodeGenerator(const Print* print = nullptr); // The default value is only used in unit tests.
     ~GCodeGenerator() = default;
 
+    // Custom non-planar support pressure tower.
+    bool   m_saw_prime_after_support = false;
+    double m_saw_tower_last_built_z  = -1.0;
+    bool   m_saw_tower_brim_done     = false;
+    double m_saw_last_e_per_mm       = 0.0;
+
     // throws std::runtime_exception on error,
     // throws CanceledException through print->throw_if_canceled().
     void            do_export(Print* print, const char* path, GCodeProcessorResult* result = nullptr, ThumbnailsGeneratorCallback thumbnail_cb = nullptr);
@@ -493,6 +499,8 @@ private:
     };
 
     std::string                         _extrude(const ExtrusionAttributes &attribs, const Geometry::ArcWelder::Path &path, std::string_view description, double speed, const EmitModifiers &emit_modifiers = EmitModifiers());
+
+    std::string _build_sawtooth_tower(double e_per_mm, double saw_path_z, bool do_prime);
 
     void                                print_machine_envelope(GCodeOutputStream &file, const Print &print);
     std::string                         _process_start_gcode(const Print &print, unsigned int current_extruder_id);

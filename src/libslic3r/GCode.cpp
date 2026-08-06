@@ -220,6 +220,7 @@ void GCodeGenerator::PlaceholderParserIntegration::reset()
     this->e_position.clear();
     this->e_retracted.clear();
     this->e_restart_extra.clear();
+    
 }
 
 void GCodeGenerator::PlaceholderParserIntegration::init(const GCodeWriter &writer)
@@ -603,6 +604,9 @@ GCodeGenerator::GCodeGenerator(const Print* print) :
 
 void GCodeGenerator::do_export(Print* print, const char* path, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb)
 {
+    m_saw_prime_after_support = false;
+    m_saw_tower_last_built_z = -DBL_MAX;
+    m_saw_tower_brim_done = false;
     CNumericLocalesSetter locales_setter;
 
     // Does the file exist? If so, we hope that it is still valid.
@@ -2794,7 +2798,28 @@ LayerResult GCodeGenerator::process_layer(
             const double writer_z{m_writer.get_position().z()};
             const double previous_z{writer_z <= std::numeric_limits<double>::epsilon() ? print_z : writer_z};
 
-            gcode += this->travel_to_first_position(first_point - to_3d(shift, 0), previous_z, ExtrusionRole::Mixed, [this]() {
+            bool first_is_support = false;
+            if (extruder_extrusions.skirt.empty() && extruder_extrusions.brim.empty()) {
+                bool has_overriden = false;
+                for (const auto &overriden : extruder_extrusions.overriden_extrusions) {
+                    if (!is_empty(overriden.slices_extrusions)) {
+                        has_overriden = true; break;
+                    }
+                }
+                if (!has_overriden) {
+                    for (const auto &normal : extruder_extrusions.normal_extrusions) {
+                        if (!normal.support_extrusions.empty()) {
+                            first_is_support = true; break;
+                        }
+                        if (!is_empty(normal.slices_extrusions)) {
+                            break;
+                        }
+                    }
+                }
+            }
+            ExtrusionRole first_role = first_is_support ? ExtrusionRole::SupportMaterial : ExtrusionRole::Perimeter;
+
+            gcode += this->travel_to_first_position(first_point - to_3d(shift, 0), previous_z, first_role, [this]() {
                 if (m_writer.multiple_extruders) {
                     return std::string{""};
                 }
@@ -3309,11 +3334,23 @@ void GCodeGenerator::GCodeOutputStream::write_format(const char* format, ...)
 std::string GCodeGenerator::travel_to_first_position(const Vec3crd& point, const double from_z, const ExtrusionRole role, const std::function<std::string()>& insert_gcode) {
     std::string gcode;
 
+    // --- BEGIN INJECTED TOWER LOGIC ---
+    bool saw_is_support = (role == ExtrusionRole::SupportMaterial || role == ExtrusionRole::SupportMaterialInterface);
+    bool saw_is_model = !saw_is_support && role != ExtrusionRole::Mixed && role != ExtrusionRole::None;
+
+    bool saw_build_tower = saw_is_model && (std::abs(m_saw_tower_last_built_z - this->m_last_layer_z) > 0.0001);
+    bool saw_prime_before_model = m_saw_prime_after_support && saw_is_model;
+
+    if (saw_build_tower || saw_prime_before_model) {
+        gcode += this->_build_sawtooth_tower(this->m_saw_last_e_per_mm, this->m_last_layer_z, saw_prime_before_model);
+    }
+    // --- END INJECTED TOWER LOGIC ---
+
     const Vec3d gcode_point = to_3d(this->point_to_gcode(point.head<2>()), unscaled(point.z()));
 
     if (!EXTRUDER_CONFIG(travel_ramping_lift) && this->last_position) {
         const Vec3crd from{to_3d(*this->last_position, scaled(from_z))};
-        gcode = this->travel_to(
+        gcode += this->travel_to(
             from, point, role, "travel to first layer point", insert_gcode, EnforceFirstZ::True
         );
     } else {
@@ -3451,6 +3488,13 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
     if (m_writer.extrusion_axis().empty())
         // gcfNoExtrusion
         e_per_mm = 0;
+
+    // --- BEGIN SAWTOOTH PRESSURE TOWER ---
+    // Store the extrusion rate of the current path for the tower logic (which intercepts travels)
+    if (e_per_mm > 0.0) {
+        this->m_saw_last_e_per_mm = e_per_mm;
+    }
+    // --- END SAWTOOTH PRESSURE TOWER ---
 
     // set speed
     if (speed == -1) {
@@ -3598,7 +3642,7 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
     }
 
 // --- BEGIN NON-PLANAR TOOLPATH INJECTION V12 ---
-    constexpr int SAW_TOP_SETTLE_MS = 80; // Start with 50–100 ms
+    constexpr int SAW_TOP_SETTLE_MS = 160; // Start with 50–100 ms
     double original_peak_z = this->m_last_layer_z;
     double bottom_z = -1.0;
     // Get support material speed in mm/min for G1 moves
@@ -3763,10 +3807,13 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
 
             if (close_dist > 0.01) {
                 constexpr double SAW_FINAL_CLOSE_FLOW_MULT = 0.50;
-
                 double e_close = e_per_mm * close_dist * SAW_FINAL_CLOSE_FLOW_MULT;
 
                 gcode += m_writer.extrude_to_xyz(previous_peak_point, e_close);
+
+                // The writer is now physically at previous_peak_point.
+                // Do not falsely claim the nozzle is at path.back().
+                this->last_position = path.back().point;
             }
         }
         // Restore feedrate to support material speed (normal pipeline will override as needed)
@@ -3774,6 +3821,8 @@ std::string GCodeGenerator::_extrude( //////////////////////////////////////////
 
         if (m_enable_cooling_markers)
             gcode += ";_EXTRUDE_END\n";
+        // The next actual model extrusion will first visit the pressure tower.
+        m_saw_prime_after_support = true;
         this->last_position = path.back().point;
         return gcode;
     }
@@ -3990,6 +4039,103 @@ Polyline GCodeGenerator::generate_travel_xy_path(
     return xy_path;
 }
 
+std::string GCodeGenerator::_build_sawtooth_tower(double e_per_mm, double saw_path_z, bool do_prime) {
+    std::string gcode;
+
+    if (e_per_mm <= 0.0) {
+        const double nozzle_d = this->m_config.nozzle_diameter.get_at(m_writer.extruder()->id());
+        const double layer_h = this->m_config.layer_height.value;
+        e_per_mm = m_writer.extruder()->e_per_mm3() * (nozzle_d * layer_h);
+    }
+
+    constexpr double SAW_TOWER_X = 40.0;
+    constexpr double SAW_TOWER_Y = 40.0;
+    constexpr double SAW_TOWER_SIZE = 20.0;
+    constexpr double SAW_TOWER_PRINT_SPEED_MMPS = 20.0;
+    constexpr double SAW_TOWER_PRIME_SPEED_MMPS = 12.0;
+    constexpr double SAW_TOWER_PRIME_FLOW_MULT = 1.10;
+
+    const Vec3d tower_a(SAW_TOWER_X, SAW_TOWER_Y, saw_path_z);
+    const Vec3d tower_b(SAW_TOWER_X + SAW_TOWER_SIZE, SAW_TOWER_Y, saw_path_z);
+    const Vec3d tower_c(SAW_TOWER_X + SAW_TOWER_SIZE, SAW_TOWER_Y + SAW_TOWER_SIZE, saw_path_z);
+    const Vec3d tower_d(SAW_TOWER_X, SAW_TOWER_Y + SAW_TOWER_SIZE, saw_path_z);
+
+    gcode += m_writer.retract();
+    bool tower_entered_unretracted = false;
+
+    if (!m_saw_tower_brim_done) {
+        constexpr double SAW_TOWER_BRIM_WIDTH = 20;
+        constexpr double SAW_TOWER_BRIM_SPACING = 0.50;
+        constexpr double SAW_TOWER_BRIM_SPEED = 15.0;
+        const double brim_f = SAW_TOWER_BRIM_SPEED * 60.0;
+        gcode += m_writer.set_speed(brim_f, "", "; sawtooth pressure tower brim");
+
+        for (double offset = SAW_TOWER_BRIM_WIDTH; offset >= 0.0; offset -= SAW_TOWER_BRIM_SPACING) {
+            const Vec3d brim_a(SAW_TOWER_X - offset, SAW_TOWER_Y - offset, saw_path_z);
+            const Vec3d brim_b(SAW_TOWER_X + SAW_TOWER_SIZE + offset, SAW_TOWER_Y - offset, saw_path_z);
+            const Vec3d brim_c(SAW_TOWER_X + SAW_TOWER_SIZE + offset, SAW_TOWER_Y + SAW_TOWER_SIZE + offset, saw_path_z);
+            const Vec3d brim_d(SAW_TOWER_X - offset, SAW_TOWER_Y + SAW_TOWER_SIZE + offset, saw_path_z);
+            const double brim_side_x = SAW_TOWER_SIZE + 2.0 * offset;
+            const double brim_e = e_per_mm * brim_side_x;
+
+            gcode += m_writer.travel_to_xyz(brim_a, "move to sawtooth tower brim");
+            if (!tower_entered_unretracted) {
+                gcode += m_writer.unretract();
+                tower_entered_unretracted = true;
+            }
+
+            gcode += m_writer.extrude_to_xyz(brim_b, brim_e);
+            gcode += m_writer.extrude_to_xyz(brim_c, e_per_mm * (SAW_TOWER_SIZE + 2.0 * offset));
+            gcode += m_writer.extrude_to_xyz(brim_d, brim_e);
+            gcode += m_writer.extrude_to_xyz(brim_a, e_per_mm * (SAW_TOWER_SIZE + 2.0 * offset));
+        }
+        m_saw_tower_brim_done = true;
+    }
+
+    gcode += m_writer.travel_to_xyz(tower_a, "move to sawtooth pressure tower");
+    if (!tower_entered_unretracted) {
+        gcode += m_writer.unretract();
+        tower_entered_unretracted = true;
+    }
+
+    if (std::abs(m_saw_tower_last_built_z - this->m_last_layer_z) > 0.0001) {
+        const double tower_f = SAW_TOWER_PRINT_SPEED_MMPS * 60.0;
+        gcode += m_writer.set_speed(tower_f, "", "; sawtooth tower structural pass");
+        const double e_side = e_per_mm * SAW_TOWER_SIZE;
+        gcode += m_writer.extrude_to_xyz(tower_b, e_side);
+        gcode += m_writer.extrude_to_xyz(tower_c, e_side);
+        gcode += m_writer.extrude_to_xyz(tower_d, e_side);
+        gcode += m_writer.extrude_to_xyz(tower_a, e_side);
+        m_saw_tower_last_built_z = this->m_last_layer_z;
+    }
+
+    if (do_prime && m_saw_prime_after_support) {
+        const double prime_f = SAW_TOWER_PRIME_SPEED_MMPS * 60.0;
+        constexpr double PRIME_WALL_OVERLAP = 0.25;
+        const double left_x = SAW_TOWER_X - PRIME_WALL_OVERLAP;
+        const double right_x = SAW_TOWER_X + SAW_TOWER_SIZE + PRIME_WALL_OVERLAP;
+        const Vec3d prime_left_1(left_x, SAW_TOWER_Y + SAW_TOWER_SIZE * 0.35, saw_path_z);
+        const Vec3d prime_right_1(right_x, SAW_TOWER_Y + SAW_TOWER_SIZE * 0.35, saw_path_z);
+        const Vec3d prime_left_2(left_x, SAW_TOWER_Y + SAW_TOWER_SIZE * 0.65, saw_path_z);
+        const Vec3d prime_right_2(right_x, SAW_TOWER_Y + SAW_TOWER_SIZE * 0.65, saw_path_z);
+        const double prime_line_length = SAW_TOWER_SIZE + 2.0 * PRIME_WALL_OVERLAP;
+        const double e_prime = e_per_mm * prime_line_length * SAW_TOWER_PRIME_FLOW_MULT;
+
+        gcode += m_writer.travel_to_xyz(prime_left_1, "position for sawtooth pressure prime");
+        gcode += m_writer.set_speed(prime_f, "", "; sawtooth pressure recovery");
+        gcode += m_writer.extrude_to_xyz(prime_right_1, e_prime);
+        gcode += m_writer.travel_to_xyz(prime_left_2, "position for second sawtooth pressure prime");
+        gcode += m_writer.extrude_to_xyz(prime_right_2, e_prime);
+
+        m_saw_prime_after_support = false;
+    }
+
+    gcode += m_writer.retract();
+    this->last_position = this->gcode_to_point(this->writer().get_position().head<2>());
+
+    return gcode;
+}
+
 // This method accepts &point in print coordinates.
 std::string GCodeGenerator::travel_to(
     const Vec3crd &start_point,
@@ -3999,15 +4145,33 @@ std::string GCodeGenerator::travel_to(
     const std::function<std::string()>& insert_gcode,
     const GCodeGenerator::EnforceFirstZ enforce_first_z
 ) {
-    const double initial_elevation{unscaled(start_point.z())};
+    std::string prefix_gcode;
+    Vec3crd actual_start_point = start_point;
+
+    // --- BEGIN INJECTED TOWER LOGIC ---
+    bool saw_is_support = (role == ExtrusionRole::SupportMaterial || role == ExtrusionRole::SupportMaterialInterface);
+    bool saw_is_model = !saw_is_support && role != ExtrusionRole::Mixed && role != ExtrusionRole::None;
+
+    bool saw_build_tower = saw_is_model && (std::abs(m_saw_tower_last_built_z - this->m_last_layer_z) > 0.0001);
+    bool saw_prime_before_model = m_saw_prime_after_support && saw_is_model;
+
+    if (saw_build_tower || saw_prime_before_model) {
+        prefix_gcode += this->_build_sawtooth_tower(this->m_saw_last_e_per_mm, this->m_last_layer_z, saw_prime_before_model);
+        if (this->last_position) {
+            actual_start_point = to_3d(*this->last_position, scaled(this->m_last_layer_z));
+        }
+    }
+    // --- END INJECTED TOWER LOGIC ---
+
+    const double initial_elevation{unscaled(actual_start_point.z())};
 
     // check whether a straight travel move would need retraction
 
     bool could_be_wipe_disabled {false};
-    bool needs_retraction = this->needs_retraction(Polyline{start_point.head<2>(), end_point.head<2>()}, role);
+    bool needs_retraction = this->needs_retraction(Polyline{actual_start_point.head<2>(), end_point.head<2>()}, role);
 
     Polyline xy_path{generate_travel_xy_path(
-        start_point.head<2>(), end_point.head<2>(), needs_retraction, could_be_wipe_disabled
+        actual_start_point.head<2>(), end_point.head<2>(), needs_retraction, could_be_wipe_disabled
     )};
 
     needs_retraction = this->needs_retraction(xy_path, role);
@@ -4065,12 +4229,12 @@ std::string GCodeGenerator::travel_to(
     travel.emplace_back(end_point);
 
     if (this->config().travel_short_distance_acceleration > 0.) {
-        return wipe_retract_gcode + generate_travel_gcode(travel, comment, insert_gcode, enforce_first_z, [&]() {
+        return prefix_gcode + wipe_retract_gcode + generate_travel_gcode(travel, comment, insert_gcode, enforce_first_z, [&]() {
                    return role.is_external_perimeter() && xy_path.length() < scaled<double>(EXTRUDER_CONFIG(retract_before_travel));
                });
     }
 
-    return wipe_retract_gcode + generate_travel_gcode(travel, comment, insert_gcode, enforce_first_z);
+    return prefix_gcode + wipe_retract_gcode + generate_travel_gcode(travel, comment, insert_gcode, enforce_first_z);
 }
 
 std::string GCodeGenerator::retract_and_wipe(bool toolchange, bool reset_e)
@@ -4224,3 +4388,4 @@ Point GCodeGenerator::gcode_to_point(const Vec2d &point) const
 }
 
 }   // namespace Slic3r
+
